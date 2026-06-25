@@ -44,27 +44,27 @@ schema:
   outdoor_temp_entity: str
   indoor_temp_entity: str
   indoor_setpoint_entity: str
-  indoor_factor: float(1.0, 50.0)
+  indoor_factor: float(1.0,50.0)
   heat_curve_entity: str
   curve_offset_entity: str
-  forecast_hours: int(1, 24)
+  forecast_hours: int(1,24)
   weather_enabled: bool
   weather_enable_up: bool
   weather_enable_down: bool
-  weather_adjust_factor: float(-2.0, 2.0)
+  weather_adjust_factor: float(-2.0,2.0)
   indoor_enabled: bool
-  indoor_target_temp: float(10.0, 28.0)
+  indoor_target_temp: float(10.0,28.0)
   price_enabled: bool
-  price_very_cheap: float(-5.0, 5.0)
-  price_cheap: float(-5.0, 5.0)
-  price_normal: float(-5.0, 5.0)
-  price_expensive: float(-5.0, 5.0)
-  price_very_expensive: float(-5.0, 5.0)
+  price_very_cheap: float(-5.0,5.0)
+  price_cheap: float(-5.0,5.0)
+  price_normal: float(-5.0,5.0)
+  price_expensive: float(-5.0,5.0)
+  price_very_expensive: float(-5.0,5.0)
   price_very_cheap_threshold: float
   price_cheap_threshold: float
   price_expensive_threshold: float
   price_very_expensive_threshold: float
-  min_write_interval_min: int(5, 120)
+  min_write_interval_min: int(5,120)
   log_level: list(debug|info|warning|error)
 
 ports:
