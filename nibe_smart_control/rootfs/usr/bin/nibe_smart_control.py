@@ -113,30 +113,42 @@ class HAClient:
             self.logger.error(f"set_number({entity_id}): {e}"); return False
 
     async def get_weather_forecast(self, entity_id: str) -> Optional[list]:
-        url = f"{self.base}/services/weather/get_forecasts"
+        # Must use ?return_response=true so the supervisor passes back the
+        # service response body (forecast data) instead of just changed states.
+        url = f"{self.base}/services/weather/get_forecasts?return_response=true"
         try:
             async with self.session.post(url, headers=self.headers,
                     json={"entity_id": entity_id, "type": "hourly"},
                     timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status in (200, 201):
                     data = await r.json()
+                    # HA returns {"service_response": {"weather.x": {"forecast": [...]}}}
+                    if isinstance(data, dict):
+                        svc = data.get("service_response", data)
+                        fc = svc.get(entity_id, {}).get("forecast")
+                        if fc: return sorted(fc, key=lambda x: x.get("datetime", ""))
+                    # Older shape: list of state-change dicts
                     if isinstance(data, list):
                         for item in data:
-                            fc = (item.get("response", {}) if isinstance(item, dict) else {}).get(entity_id, {}).get("forecast")
-                            if fc: return sorted(fc, key=lambda x: x.get("datetime", ""))
-                    if isinstance(data, dict):
-                        fc = data.get(entity_id, {}).get("forecast")
-                        if fc: return sorted(fc, key=lambda x: x.get("datetime", ""))
+                            if isinstance(item, dict):
+                                fc = item.get("response", {}).get(entity_id, {}).get("forecast")
+                                if fc: return sorted(fc, key=lambda x: x.get("datetime", ""))
+                    self.logger.warning(f"get_forecasts returned unexpected shape: {str(data)[:200]}")
         except Exception as e:
-            self.logger.debug(f"get_forecasts: {e}")
+            self.logger.warning(f"get_forecasts service call failed: {e}")
+        # Fallback: attributes (older HA or custom integrations)
         try:
             async with self.session.get(f"{self.base}/states/{entity_id}", headers=self.headers,
                     timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     s = await r.json()
                     fc = s.get("attributes", {}).get("forecast", [])
-                    if fc: return sorted(fc, key=lambda x: x.get("datetime", ""))
-        except Exception: pass
+                    if fc:
+                        self.logger.debug(f"get_forecasts: using attributes fallback for {entity_id}")
+                        return sorted(fc, key=lambda x: x.get("datetime", ""))
+        except Exception as e:
+            self.logger.debug(f"get_forecasts attributes fallback failed: {e}")
+        self.logger.warning(f"get_forecasts: no forecast data found for {entity_id}")
         return None
 
     async def list_entities(self, domain: str = "") -> list:
@@ -1303,11 +1315,18 @@ function PlanningTab({status, cfg}) {
     // Timeline
     h(Card, {title:'24h hourly plan'},
       h('div', {style:{overflowX:'auto'}},
-        h('div', {style:{minWidth:700}},
-          // Header
-          h('div', {style:{display:'grid',gridTemplateColumns:'60px 1fr 90px 100px 60px 60px 1fr',gap:8,padding:'0 0 8px',borderBottom:'1px solid #2a3050',fontSize:10,textTransform:'uppercase',letterSpacing:'.07em',color:'#7b87a8',marginBottom:4}},
+        h('div', {style:{minWidth:860}},
+          // ── Header ──────────────────────────────────────────────────────
+          h('div', {style:{
+            display:'grid',
+            gridTemplateColumns:'52px 160px 52px 70px 72px 52px 52px 1fr',
+            gap:10, padding:'0 6px 8px', borderBottom:'1px solid #2a3050',
+            fontSize:10, textTransform:'uppercase', letterSpacing:'.07em',
+            color:'#7b87a8', marginBottom:2,
+          }},
             h('div',null,'Time'),
-            h('div',null,'Planned offset'),
+            h('div',{style:{textAlign:'center'}},'Offset'),
+            h('div',null,''),  // value label column
             h('div',null,'Temp'),
             h('div',null,'Price'),
             h('div',null,'Solar'),
@@ -1315,55 +1334,78 @@ function PlanningTab({status, cfg}) {
             h('div',null,'Actions')
           ),
           plan.map((slot, i) => {
-            const dt   = new Date(slot.ts * 1000);
-            const past = slot.ts < now - 60;
-            const curr = !past && (i === 0 || plan[i-1].ts < now);
+            const dt      = new Date(slot.ts * 1000);
+            const past    = slot.ts < now - 60;
+            const curr    = !past && (i === 0 || plan[i-1].ts < now);
             const timeStr = dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+            const v       = slot.combined_plan_offset || 0;
+            const barColor = v > 0.05 ? '#f7953a' : v < -0.05 ? '#3a82f7' : '#2a3050';
+            const valColor = v > 0.05 ? '#f7953a' : v < -0.05 ? '#3a82f7' : '#7b87a8';
+
+            // Centred bidirectional bar: total width 140px, zero at centre (70px)
+            const BAR_HALF = 70;
+            const maxAbs   = Math.max(1, maxAbsOff);
+            const barPx    = Math.round(Math.abs(v) / maxAbs * BAR_HALF);
+            const barLeft  = v >= 0 ? BAR_HALF : BAR_HALF - barPx;
+
+            // Actions: one per line, colour by type
+            const actionEls = (slot.actions || []).map((a, ai) => {
+              const c = a.includes('Pre-heat') ? '#f6d24a'
+                      : a.includes('Cheap') || a.includes('Solar') || a.includes('Battery') ? '#2ec27e'
+                      : a.includes('Expensive') ? '#e05c2a'
+                      : '#7b87a8';
+              return h('div', {key:ai, style:{color:c, fontSize:11, lineHeight:'1.5'}}, a);
+            });
 
             return h('div', {key:i, style:{
-              display:'grid', gridTemplateColumns:'60px 1fr 90px 100px 70px 70px 150px',
-              gap:8, padding:'5px 0', borderBottom:'1px solid #1f2436',
-              alignItems:'center', opacity: past ? 0.4 : 1,
-              background: curr ? 'rgba(224,92,42,.06)' : 'transparent',
+              display:'grid',
+              gridTemplateColumns:'52px 160px 52px 70px 72px 52px 52px 1fr',
+              gap:10, padding:'6px 6px',
+              borderBottom:'1px solid rgba(42,48,80,.6)',
+              alignItems:'center',
+              opacity: past ? 0.35 : 1,
+              background: curr ? 'rgba(224,92,42,.07)' : i%2===0 ? 'transparent' : 'rgba(31,36,54,.3)',
+              borderRadius:4,
             }},
               // Time
-              h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:12,color:curr?'#e05c2a':'#7b87a8',fontWeight:curr?700:400}},
-                timeStr, curr && h('div',{style:{fontSize:9,color:'#e05c2a',fontWeight:700}},'NOW')
+              h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:12,color:curr?'#e05c2a':'#7b87a8',fontWeight:curr?700:400,lineHeight:'1.3'}},
+                timeStr,
+                curr && h('div',{style:{fontSize:9,fontWeight:700,color:'#e05c2a',letterSpacing:'.06em'}},'NOW')
               ),
-              // Offset bar
-              h('div', {style:{display:'flex',alignItems:'center',gap:6}},
-                h('div', {style:{
-                  width: barW(slot.combined_plan_offset, maxAbsOff),
-                  height:8, borderRadius:3,
-                  background: slot.combined_plan_offset > 0 ? '#f7953a' : slot.combined_plan_offset < 0 ? '#3a82f7' : '#2a3050',
-                  marginLeft: slot.combined_plan_offset >= 0 ? 60 : (60 - barW(slot.combined_plan_offset, maxAbsOff)),
-                  transition:'width .3s',
-                }}),
-                h('span',{style:{fontFamily:'ui-monospace,monospace',fontSize:11,color:slot.combined_plan_offset>0?'#f7953a':slot.combined_plan_offset<0?'#3a82f7':'#7b87a8',minWidth:40}},
-                  (slot.combined_plan_offset>0?'+':'')+slot.combined_plan_offset.toFixed(1)+'°C')
+              // Offset bar — bidirectional, centred at 70px
+              h('div', {style:{position:'relative',height:8,background:'rgba(42,48,80,.8)',borderRadius:4,overflow:'hidden'}},
+                h('div', {style:{position:'absolute',top:0,bottom:0,left:'50%',width:1,background:'rgba(255,255,255,.12)',zIndex:1}}),
+                barPx > 0 && h('div', {style:{
+                  position:'absolute', top:1, bottom:1,
+                  left:barLeft, width:barPx,
+                  background:barColor, borderRadius:3,
+                  transition:'left .4s, width .4s',
+                }})
+              ),
+              // Offset value
+              h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:12,fontWeight:600,color:valColor,textAlign:'right'}},
+                (v>0?'+':'')+v.toFixed(1)+'°'
               ),
               // Temp
-              h('div', {style:{display:'flex',alignItems:'center',gap:5}},
-                slot.temp != null && h('div',{style:{width:tempBar(slot.temp),height:4,borderRadius:2,background:'#3a82f755',flexShrink:0}}),
-                h('span',{style:{fontSize:11,color:'#7b87a8'}}, slot.temp != null ? slot.temp.toFixed(1)+'°C' : '—')
+              h('div', {style:{fontSize:12,color: slot.temp != null ? '#e4e9f7' : '#2a3050'}},
+                slot.temp != null ? slot.temp.toFixed(1)+'°C' : '—'
               ),
-              // Price
+              // Price with dot
               h('div', {style:{display:'flex',alignItems:'center',gap:5}},
                 slot.price != null && h(PriceLevelDot, {level:slot.price_level}),
-                h('span',{style:{fontSize:11,color:'#7b87a8'}}, slot.price != null ? '€'+slot.price.toFixed(4) : '—')
+                h('span',{style:{fontFamily:'ui-monospace,monospace',fontSize:11,color:slot.price!=null?'#e4e9f7':'#2a3050'}},
+                  slot.price != null ? '€'+slot.price.toFixed(4) : '—')
               ),
-              // Solar
-              h('div', {style:{fontSize:11,color: slot.solar_fraction > 0.5 ? '#f6d24a' : '#7b87a8'}},
-                slot.solar_fraction > 0 ? `${Math.round(slot.solar_fraction*100)}%` : '—'
+              // Solar %
+              h('div', {style:{fontSize:11,color: (slot.solar_fraction||0) > 0.3 ? '#f6d24a' : '#2a3050',textAlign:'center'}},
+                (slot.solar_fraction||0) > 0 ? Math.round(slot.solar_fraction*100)+'%' : '—'
               ),
-              // Battery
-              h('div', {style:{fontSize:11,color: slot.battery_offset > 0 ? '#2ec27e' : '#7b87a8'}},
-                slot.battery_offset > 0 ? `+${slot.battery_offset}` : '—'
+              // Battery bonus
+              h('div', {style:{fontSize:11,color:(slot.battery_offset||0)>0?'#2ec27e':'#2a3050',textAlign:'center'}},
+                (slot.battery_offset||0) > 0 ? '+'+slot.battery_offset.toFixed(1) : '—'
               ),
               // Actions
-              h('div', {style:{fontSize:10,color:'#e05c2a',lineHeight:1.5}},
-                (slot.actions||[]).join(' · ') || ''
-              )
+              h('div', {style:{lineHeight:1}}, actionEls.length ? actionEls : h('span',{style:{color:'#2a3050',fontSize:11}},'—'))
             );
           })
         )
