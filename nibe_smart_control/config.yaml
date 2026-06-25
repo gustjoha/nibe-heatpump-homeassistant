@@ -1,6 +1,6 @@
 name: "Nibe Smart Control"
 description: "Intelligent heat curve control for Nibe F-series heat pumps. Adjusts heating based on weather forecast, indoor temperature and electricity price. Includes a web dashboard with history and charts."
-version: "1.1.0"
+version: "1.2.0"
 slug: "nibe_smart_control"
 init: false
 arch:
@@ -8,72 +8,17 @@ arch:
   - amd64
 
 homeassistant_api: true
-
-options:
-  weather_entity: "weather.forecast_home"
-  electricity_price_entity: "sensor.nordpool_kwh_lt_eur_3_10_025"
-  outdoor_temp_entity: "sensor.nibe_outdoor_temperature"
-  indoor_temp_entity: ""
-  indoor_setpoint_entity: ""
-  indoor_factor: 10.0
-  heat_curve_entity: "number.nibe_heat_curve_s1"
-  curve_offset_entity: "number.nibe_heat_offset_s1"
-  forecast_hours: 6
-  weather_enabled: true
-  weather_enable_up: true
-  weather_enable_down: true
-  weather_adjust_factor: 0.0
-  indoor_enabled: false
-  indoor_target_temp: 21.0
-  price_enabled: true
-  price_very_cheap: 2.0
-  price_cheap: 1.0
-  price_normal: 0.0
-  price_expensive: -1.0
-  price_very_expensive: -2.0
-  price_very_cheap_threshold: 0.05
-  price_cheap_threshold: 0.08
-  price_expensive_threshold: 0.14
-  price_very_expensive_threshold: 0.20
-  min_write_interval_min: 10
-  log_level: "info"
-
-schema:
-  weather_entity: str
-  electricity_price_entity: str
-  outdoor_temp_entity: str
-  indoor_temp_entity: str
-  indoor_setpoint_entity: str
-  indoor_factor: float(1.0,50.0)
-  heat_curve_entity: str
-  curve_offset_entity: str
-  forecast_hours: int(1,24)
-  weather_enabled: bool
-  weather_enable_up: bool
-  weather_enable_down: bool
-  weather_adjust_factor: float(-2.0,2.0)
-  indoor_enabled: bool
-  indoor_target_temp: float(10.0,28.0)
-  price_enabled: bool
-  price_very_cheap: float(-5.0,5.0)
-  price_cheap: float(-5.0,5.0)
-  price_normal: float(-5.0,5.0)
-  price_expensive: float(-5.0,5.0)
-  price_very_expensive: float(-5.0,5.0)
-  price_very_cheap_threshold: float
-  price_cheap_threshold: float
-  price_expensive_threshold: float
-  price_very_expensive_threshold: float
-  min_write_interval_min: int(5,120)
-  log_level: list(debug|info|warning|error)
-
-ports:
-  8099/tcp: 8099
-
-ports_description:
-  8099/tcp: "Web dashboard"
-
+auth_api: true
+ingress: true
+ingress_port: 8099
 panel_icon: mdi:heat-pump
 panel_title: Nibe Smart Control
 
-image: "ghcr.io/gustjoha/nibe-heatpump-homeassistant/{arch}"
+options:
+  log_level: "info"
+
+schema:
+  log_level: list(debug|info|warning|error)
+
+map:
+  - share:rw
