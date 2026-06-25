@@ -1,0 +1,82 @@
+configuration:
+  weather_entity:
+    name: Weather entity
+    description: HA weather entity for forecast (e.g. weather.forecast_home)
+  electricity_price_entity:
+    name: Electricity price entity
+    description: Sensor with current electricity price (Nordpool, Tibber, etc.)
+  outdoor_temp_entity:
+    name: Outdoor temperature entity
+    description: NibeGW outdoor temperature sensor (register 40004)
+  indoor_temp_entity:
+    name: Indoor temperature entity
+    description: Your indoor temperature sensor (e.g. sensor.living_room_temperature)
+  indoor_setpoint_entity:
+    name: Indoor setpoint entity (optional)
+    description: Entity providing the indoor setpoint. Leave blank to use Target Indoor Temp below.
+  indoor_factor:
+    name: Indoor P-factor
+    description: "Proportional gain: offset = (setpoint − actual) × factor. NibePi default: 10"
+  heat_curve_entity:
+    name: Heat curve entity (read-only)
+    description: NibeGW heat curve steepness (register 47007)
+  curve_offset_entity:
+    name: Curve offset entity (write)
+    description: NibeGW heat curve offset (register 47011) — addon writes here
+  forecast_hours:
+    name: Forecast lookahead (hours)
+    description: How many hours ahead to look for temperature prediction (1–24)
+  weather_enabled:
+    name: Enable weather control
+    description: Adjust curve based on weather forecast
+  weather_enable_up:
+    name: Allow upward weather adjustment
+    description: Allow raising the offset (heat up ahead of cold snap)
+  weather_enable_down:
+    name: Allow downward weather adjustment
+    description: Allow lowering the offset (coast ahead of warm spell)
+  weather_adjust_factor:
+    name: Static weather bias (°C)
+    description: Fixed ±°C added to weather offset. Use if your pump tends to overshoot.
+  indoor_enabled:
+    name: Enable indoor temperature control
+    description: Proportional controller keeping indoor temp at setpoint
+  indoor_target_temp:
+    name: Target indoor temperature (°C)
+    description: Used when no setpoint entity is specified
+  price_enabled:
+    name: Enable price control
+    description: Adjust curve based on electricity price level
+  price_very_cheap:
+    name: Offset — VERY CHEAP (°C)
+    description: Curve offset when electricity is very cheap
+  price_cheap:
+    name: Offset — CHEAP (°C)
+    description: Curve offset when electricity is cheap
+  price_normal:
+    name: Offset — NORMAL (°C)
+    description: Curve offset at normal prices (usually 0)
+  price_expensive:
+    name: Offset — EXPENSIVE (°C)
+    description: Curve offset when electricity is expensive
+  price_very_expensive:
+    name: Offset — VERY EXPENSIVE (°C)
+    description: Curve offset when electricity is very expensive
+  price_very_cheap_threshold:
+    name: Very cheap threshold
+    description: Price at or below this is VERY_CHEAP (same unit as price sensor)
+  price_cheap_threshold:
+    name: Cheap threshold
+    description: Price at or below this is CHEAP
+  price_expensive_threshold:
+    name: Expensive threshold
+    description: Price at or above this is EXPENSIVE
+  price_very_expensive_threshold:
+    name: Very expensive threshold
+    description: Price at or above this is VERY_EXPENSIVE
+  min_write_interval_min:
+    name: Min. minutes between writes
+    description: Rate limiting — protects the heat pump from too-frequent adjustments (5–120 min)
+  log_level:
+    name: Log level
+    description: Verbosity of addon logs

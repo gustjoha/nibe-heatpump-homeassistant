@@ -1,0 +1,11 @@
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.19
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.19
+squash: false
+labels:
+  org.opencontainers.image.title: "Nibe Smart Control"
+  org.opencontainers.image.description: "Intelligent heat curve control for Nibe heat pumps"
+  org.opencontainers.image.source: "https://github.com/gustjoha/nibe-heatpump-homeassistant"
+  org.opencontainers.image.licenses: "MIT"
+  io.hass.name: "Nibe Smart Control"
+  io.hass.type: "addon"

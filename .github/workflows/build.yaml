@@ -1,0 +1,115 @@
+name: Build and Push Addon
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            platform: linux/arm64
+            base_image: ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.19
+          - arch: amd64
+            platform: linux/amd64
+            base_image: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.19
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify structure
+        run: |
+          echo "── repo root ──"
+          ls -1
+          echo "── nibe_smart_control/ ──"
+          ls -1 nibe_smart_control/
+          echo "── nibe_smart_control/rootfs/usr/bin/ ──"
+          ls -1 nibe_smart_control/rootfs/usr/bin/
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep '^version:' nibe_smart_control/config.yaml | awk '{print $2}' | tr -d '"')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building v$VERSION for ${{ matrix.arch }}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./nibe_smart_control
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: BUILD_FROM=${{ matrix.base_image }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nibe-heatpump-homeassistant/${{ matrix.arch }}:latest
+            ghcr.io/${{ github.repository_owner }}/nibe-heatpump-homeassistant/${{ matrix.arch }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          labels: |
+            org.opencontainers.image.title=Nibe Smart Control (${{ matrix.arch }})
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            io.hass.name=Nibe Smart Control
+            io.hass.arch=${{ matrix.arch }}
+            io.hass.type=addon
+            io.hass.version=${{ steps.version.outputs.version }}
+
+  make-packages-public:
+    name: Make packages public
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, amd64]
+    steps:
+      - name: Set visibility to public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGE="nibe-heatpump-homeassistant%2F${{ matrix.arch }}"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"visibility":"public"}' \
+            "https://api.github.com/user/packages/container/${PACKAGE}")
+          echo "HTTP $HTTP_CODE for ${{ matrix.arch }}"
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "Set manually: https://github.com/users/${{ github.repository_owner }}/packages/container/${PACKAGE}/settings"
+          fi
