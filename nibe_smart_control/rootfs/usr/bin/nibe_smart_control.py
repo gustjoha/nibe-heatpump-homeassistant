@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "price_expensive": -1.0, "price_very_expensive": -2.0,
     "price_very_cheap_threshold": 0.05, "price_cheap_threshold": 0.08,
     "price_expensive_threshold": 0.14, "price_very_expensive_threshold": 0.20,
-    "min_write_interval_min": MIN_WRITE_INTERVAL, "log_level": "info",
+    "min_write_interval_min": MIN_WRITE_INTERVAL, "dry_run": True, "log_level": "info",
 }
 
 # ---------------------------------------------------------------------------
@@ -206,8 +206,20 @@ class NibeController:
     async def run(self, session: aiohttp.ClientSession):
         self.ha = HAClient(session, self.logger)
         self.logger.info("Controller started")
-        await asyncio.gather(self._weather_loop(), self._indoor_loop(),
-                             self._price_loop(), self._apply_loop())
+        await asyncio.gather(self._outdoor_loop(), self._weather_loop(),
+                             self._indoor_loop(), self._price_loop(), self._apply_loop())
+
+    async def _outdoor_loop(self):
+        """Read outdoor sensor every 2 min, independently of weather forecast."""
+        while True:
+            try:
+                val = await self.ha.get_float(self.cfg.get("outdoor_temp_entity", ""))
+                if val is not None:
+                    self.state["last_outdoor_temp"] = val
+                    self._live["outdoor_temp"] = val
+            except Exception as e:
+                self.logger.error(f"outdoor: {e}")
+            await asyncio.sleep(2 * 60)
 
     async def _weather_loop(self):
         while True:
@@ -284,8 +296,9 @@ class NibeController:
         self.logger.info(f"Price: {price:.4f} → {level} → {offset:+.1f}")
 
     async def _apply(self):
-        cfg = self.cfg
-        s   = self.state
+        cfg      = self.cfg
+        s        = self.state
+        dry_run  = bool(cfg.get("dry_run", True))
         w   = float(s.get("weather_offset") or 0)
         ind = float(s.get("indoor_offset")  or 0)
         p   = float(s.get("price_offset")   or 0)
@@ -297,10 +310,17 @@ class NibeController:
         if delta < 0.2: return
         if delta < 0.5 and elapsed < min_interval: return
         offset_entity = cfg.get("curve_offset_entity", "")
-        if not offset_entity: return
+        if not offset_entity and not dry_run: return
         reasons = self._build_reasons(w, ind, p, cfg, s)
-        self.logger.info(f"Apply {combined:+.1f}°C → {offset_entity}")
-        if await self.ha.set_number(offset_entity, combined):
+        if dry_run:
+            self.logger.info(f"DRY RUN — would apply {combined:+.1f}°C (not written to pump)")
+        else:
+            self.logger.info(f"Apply {combined:+.1f}°C → {offset_entity}")
+        # In dry run: always log but never write. Outside dry run: log only on success.
+        wrote = False
+        if not dry_run:
+            wrote = await self.ha.set_number(offset_entity, combined)
+        if dry_run or wrote:
             s.update({"last_combined_offset": combined, "last_write_ts": int(time.time())})
             save_json(STATE_FILE, s)
             entry = {"ts": int(time.time()), "combined": combined,
@@ -309,6 +329,7 @@ class NibeController:
                      "outdoor_temp": s.get("last_outdoor_temp"), "indoor_temp": s.get("last_indoor_temp"),
                      "indoor_setpoint": s.get("last_indoor_setpoint"),
                      "forecast_temp": s.get("last_forecast_temp"), "price_value": s.get("last_price"),
+                     "dry_run": dry_run,
                      "reasons": reasons}
             self.history.append(entry)
             save_json(HISTORY_FILE, self.history[-MAX_HISTORY:])
@@ -351,6 +372,7 @@ class NibeController:
             "last_indoor_setpoint": s.get("last_indoor_setpoint"),
             "last_forecast_temp":   s.get("last_forecast_temp"),
             "last_price":           s.get("last_price"),
+            "dry_run": bool(self.cfg.get("dry_run", True)),
             **self._live,
         }
 
@@ -393,7 +415,7 @@ class WebApp:
                       "price_very_expensive_threshold","min_write_interval_min"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
-                      "indoor_enabled","price_enabled"]:
+                      "indoor_enabled","price_enabled","dry_run"]:
                 if k in body: body[k] = bool(body[k])
             self.ctrl.cfg.update(body)
             save_json(CONFIG_FILE, self.ctrl.cfg)
@@ -696,8 +718,12 @@ function HistoryRow({entry}) {
     if (r.includes('Electricity') || r.includes('CHEAP') || r.includes('EXPENSIVE')) return {color:'#e05c2a',bg:'#e05c2a11',border:'#e05c2a44',icon:'⚡'};
     return {color:'#7b87a8',bg:'transparent',border:'#2a3050',icon:'•'};
   };
-  return h('div', {style:{display:'grid',gridTemplateColumns:'120px 80px 1fr',gap:10,padding:'11px 0',borderBottom:'1px solid #2a3050',alignItems:'start'}},
-    h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:11,color:'#7b87a8'}}, fmtTs(entry.ts)),
+  const isDry = entry.dry_run === true;
+  return h('div', {style:{display:'grid',gridTemplateColumns:'120px 80px 1fr',gap:10,padding:'11px 0',borderBottom:'1px solid #2a3050',alignItems:'start',opacity:isDry?0.75:1}},
+    h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:11,color:'#7b87a8'}},
+      fmtTs(entry.ts),
+      isDry && h('span', {style:{display:'inline-block',marginLeft:5,padding:'1px 5px',borderRadius:3,fontSize:9,fontWeight:700,letterSpacing:'.05em',color:'#f6d24a',background:'rgba(246,210,74,.12)',border:'1px solid rgba(246,210,74,.3)'}}, 'DRY RUN')
+    ),
     h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:15,fontWeight:700,color:offColor(entry.combined)}}, fmtOff(entry.combined)),
     h('div', {style:{fontSize:12,color:'#7b87a8',lineHeight:1.7}},
       (entry.reasons||[]).map((r,i) => {
@@ -714,9 +740,21 @@ function HistoryRow({entry}) {
 // ── Dashboard tab ─────────────────────────────────────────────────────────────
 function DashboardTab({status, cfg}) {
   const minInterval = (cfg && cfg.min_write_interval_min) || 10;
+  const dryRun = status.dry_run !== false;  // default true until explicitly disabled
   const elapsed = status.last_write_ts ? (Date.now()/1000 - status.last_write_ts) : null;
   const rem = elapsed != null ? Math.max(0, minInterval * 60 - elapsed) : null;
   return h('div', {style:{animation:'fadeIn .3s ease'}},
+    dryRun && h('div', {style:{
+      background:'rgba(246,210,74,.08)', border:'1px solid rgba(246,210,74,.35)',
+      borderRadius:8, padding:'12px 18px', marginBottom:14,
+      display:'flex', alignItems:'center', gap:12,
+    }},
+      h('div', {style:{fontSize:20, lineHeight:1}}, '🔬'),
+      h('div', null,
+        h('div', {style:{fontWeight:700, fontSize:13, color:'#f6d24a', marginBottom:2}}, 'Dry Run mode — heat pump is not being controlled'),
+        h('div', {style:{fontSize:12, color:'#7b87a8'}}, 'The addon is calculating and logging what it would do, but writing nothing to the pump. Disable Dry Run in Settings when you are ready to go live.')
+      )
+    ),
     h(Grid, {cols:3},
       h(Card, {title:'Combined offset'},   h(Stat, {label:'Written to heat pump', value:fmtOff(status.combined_offset), valueColor:offColor(status.combined_offset), note:'Last: '+fmtTs(status.last_write_ts)})),
       h(Card, {title:'Outdoor'},           h(Stat, {label:'Current', value:fmtTemp(status.last_outdoor_temp), note:status.last_forecast_temp!=null?'Forecast → '+fmtTemp(status.last_forecast_temp):''})),
@@ -859,6 +897,16 @@ function SettingsTab() {
         h(NumField, {label:'Cheap ≤',      value:cfg.price_cheap_threshold,      min:0, step:0.01, onChange:v=>set('price_cheap_threshold',v)}),
         h(NumField, {label:'Expensive ≥',  value:cfg.price_expensive_threshold,  min:0, step:0.01, onChange:v=>set('price_expensive_threshold',v)}),
         h(NumField, {label:'Very Expensive ≥', value:cfg.price_very_expensive_threshold, min:0, step:0.01, onChange:v=>set('price_very_expensive_threshold',v)}),
+      ),
+
+      h(SectionHead, {title:'Dry Run'}),
+      h('div', {style:{background:'rgba(246,210,74,.06)',border:'1px solid rgba(246,210,74,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14}},
+        h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
+          'When enabled, the addon calculates and logs every decision it would make, but ',
+          h('strong', {style:{color:'#f6d24a'}}, 'never writes'),
+          ' to the heat pump. Run for a week to verify the logic before going live.'
+        ),
+        h(Toggle, {label:'Dry Run — observe only, do not control heat pump', checked:!!cfg.dry_run, onChange:v=>set('dry_run',v)})
       ),
 
       h(SectionHead, {title:'Rate limiting'}),
