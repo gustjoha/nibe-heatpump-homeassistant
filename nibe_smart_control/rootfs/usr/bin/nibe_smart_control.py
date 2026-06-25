@@ -25,7 +25,7 @@ LOG_LEVEL_MAP = {"debug": logging.DEBUG, "info": logging.INFO,
                  "warning": logging.WARNING, "error": logging.ERROR}
 
 DEFAULT_CONFIG = {
-    "weather_entity": "", "electricity_price_entity": "",
+    "weather_entity": "", "electricity_price_entity": "sensor.electricity_price",
     "outdoor_temp_entity": "", "indoor_temp_entity": "",
     "indoor_setpoint_entity": "", "heat_curve_entity": "",
     "curve_offset_entity": "",
@@ -36,9 +36,15 @@ DEFAULT_CONFIG = {
     "price_enabled": False,
     "price_very_cheap": 2.0, "price_cheap": 1.0, "price_normal": 0.0,
     "price_expensive": -1.0, "price_very_expensive": -2.0,
-    "price_very_cheap_threshold": 0.05, "price_cheap_threshold": 0.08,
-    "price_expensive_threshold": 0.14, "price_very_expensive_threshold": 0.20,
-    "min_write_interval_min": MIN_WRITE_INTERVAL, "dry_run": True, "log_level": "info",
+    "price_very_cheap_threshold": 0.15, "price_cheap_threshold": 0.22,
+    "price_expensive_threshold": 0.32, "price_very_expensive_threshold": 0.38,
+    "min_write_interval_min": MIN_WRITE_INTERVAL, "dry_run": True,
+    "planning_enabled": True, "planning_lookahead_hours": 24,
+    "price_preheat_hours": 2,
+    "solar_enabled": False, "solar_peak_kwh": 10.0,
+    "solar_weight": 0.4, "battery_entity": "", "battery_weight": 0.3,
+    "battery_useful_soc_min": 20.0,
+    "log_level": "info",
 }
 
 # ---------------------------------------------------------------------------
@@ -152,9 +158,25 @@ class HAClient:
         return []
 
 # ---------------------------------------------------------------------------
-def classify_price(price: float, cfg: dict) -> str:
-    t = [cfg.get("price_very_cheap_threshold", 0.05), cfg.get("price_cheap_threshold", 0.08),
-         cfg.get("price_expensive_threshold", 0.14),  cfg.get("price_very_expensive_threshold", 0.20)]
+def classify_price(price: float, cfg: dict, all_prices: list = None) -> str:
+    """
+    Dynamic classification: if all_prices (the 48h price series) is provided,
+    use percentile bands so thresholds self-adjust to the current market.
+    Falls back to fixed thresholds when no series is available (reactive loop).
+    Percentile bands: VERY_CHEAP ≤15%, CHEAP ≤40%, NORMAL ≤75%, EXPENSIVE ≤92%, else VERY_EXPENSIVE
+    """
+    if all_prices and len(all_prices) >= 4:
+        sorted_p = sorted(all_prices)
+        n = len(sorted_p)
+        def pct(p): return sorted_p[min(int(p * n / 100), n-1)]
+        if price <= pct(15):  return "VERY_CHEAP"
+        if price <= pct(40):  return "CHEAP"
+        if price <= pct(75):  return "NORMAL"
+        if price <= pct(92):  return "EXPENSIVE"
+        return "VERY_EXPENSIVE"
+    # Fallback: fixed thresholds (used by reactive price loop)
+    t = [cfg.get("price_very_cheap_threshold", 0.15), cfg.get("price_cheap_threshold", 0.22),
+         cfg.get("price_expensive_threshold", 0.32),  cfg.get("price_very_expensive_threshold", 0.38)]
     if price <= t[0]: return "VERY_CHEAP"
     if price <= t[1]: return "CHEAP"
     if price <  t[2]: return "NORMAL"
@@ -202,12 +224,14 @@ class NibeController:
         self.history: List[dict] = load_json(HISTORY_FILE, [])
         self.ha: Optional[HAClient] = None
         self._live: dict = {}
+        self._plan: List[dict] = []  # 24h hourly plan slots
 
     async def run(self, session: aiohttp.ClientSession):
         self.ha = HAClient(session, self.logger)
         self.logger.info("Controller started")
         await asyncio.gather(self._outdoor_loop(), self._weather_loop(),
-                             self._indoor_loop(), self._price_loop(), self._apply_loop())
+                             self._indoor_loop(), self._price_loop(),
+                             self._planning_loop(), self._apply_loop())
 
     async def _outdoor_loop(self):
         """Read outdoor sensor every 2 min, independently of weather forecast."""
@@ -240,6 +264,215 @@ class NibeController:
             try: await self._run_price()
             except Exception as e: self.logger.error(f"price: {e}")
             await asyncio.sleep(5 * 60)
+
+    async def _planning_loop(self):
+        """Rebuild the 24h plan every hour."""
+        await asyncio.sleep(90)
+        while True:
+            try: await self._run_planning()
+            except Exception as e: self.logger.error(f"planning: {e}")
+            await asyncio.sleep(60 * 60)
+
+    async def _run_planning(self):
+        cfg = self.cfg
+        if not cfg.get("planning_enabled", True):
+            self._plan = []; return
+
+        lookahead = int(cfg.get("planning_lookahead_hours", 24))
+        preheat_h = int(cfg.get("price_preheat_hours", 2))
+        now       = datetime.now(timezone.utc)
+
+        # ── Fetch weather forecast (temp + UV + cloud per hour) ────────────
+        forecasts = await self.ha.get_weather_forecast(cfg.get("weather_entity", ""))
+        fc_by_hour: dict = {}  # h_offset -> full forecast dict
+        if forecasts:
+            for fc in forecasts:
+                try:
+                    dt = datetime.fromisoformat(fc["datetime"].replace("Z", "+00:00"))
+                    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                    h = int((dt - now).total_seconds() / 3600)
+                    if 0 <= h < lookahead:
+                        fc_by_hour[h] = fc
+                except Exception: continue
+
+        # ── Fetch Nordpool price series using raw timestamps ───────────────
+        price_by_hour: dict = {}
+        all_prices_raw: list = []  # flat list for percentile calc
+        price_entity = cfg.get("electricity_price_entity", "")
+        if price_entity:
+            url = f"{self.ha.base}/states/{price_entity}"
+            try:
+                async with self.ha.session.get(url, headers=self.ha.headers,
+                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        attrs = data.get("attributes", {})
+                        raw_entries = attrs.get("raw_today", []) + attrs.get("raw_tomorrow", [])
+                        buckets: dict = {}
+                        for entry in raw_entries:
+                            if not entry or entry.get("value") is None: continue
+                            try:
+                                dt = datetime.fromisoformat(entry["start"])
+                                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                                h_offset = int((dt - now).total_seconds() / 3600)
+                                val = float(entry["value"])
+                                all_prices_raw.append(val)
+                                if 0 <= h_offset < lookahead:
+                                    buckets.setdefault(h_offset, []).append(val)
+                            except Exception: continue
+                        price_by_hour = {h: sum(v)/len(v) for h, v in buckets.items() if v}
+            except Exception as e:
+                self.logger.debug(f"planning price fetch: {e}")
+
+        # ── Fetch current battery SoC ──────────────────────────────────────
+        battery_soc: float = None
+        battery_entity = cfg.get("battery_entity", "")
+        if battery_entity and cfg.get("solar_enabled", False):
+            try:
+                val = await self.ha.get_float(battery_entity)
+                if val is not None:
+                    battery_soc = val
+                    self._live["battery_soc"] = battery_soc
+            except Exception: pass
+
+        if not price_by_hour and not fc_by_hour:
+            self.logger.debug("Planning: no data available")
+            return
+
+        # ── Solar scoring per hour ─────────────────────────────────────────
+        # Use UV index + cloud coverage from OWM forecast to estimate relative
+        # solar output as a fraction of peak_kwh (0.0 – 1.0).
+        # Formula: solar_fraction = uv_index/11 * (1 - cloud_coverage/100) * 0.85
+        # This is intentionally approximate — weighted down vs price anyway.
+        solar_enabled  = cfg.get("solar_enabled", False)
+        peak_kwh       = float(cfg.get("solar_peak_kwh", 10.0))
+        solar_weight   = float(cfg.get("solar_weight", 0.4))
+        battery_weight = float(cfg.get("battery_weight", 0.3))
+        batt_soc_min   = float(cfg.get("battery_useful_soc_min", 20.0))
+
+        def solar_fraction(fc_slot: dict) -> float:
+            uv  = float(fc_slot.get("uv_index") or 0)
+            cc  = float(fc_slot.get("cloud_coverage") or 0)
+            return min(1.0, max(0.0, (uv / 11.0) * (1.0 - cc / 100.0) * 0.85))
+
+        def battery_coverage(soc: float) -> float:
+            """0.0–1.0 — how much useful battery reserve exists above minimum."""
+            if soc is None: return 0.0
+            usable = max(0.0, soc - batt_soc_min)
+            return min(1.0, usable / max(1.0, 100.0 - batt_soc_min))
+
+        # ── Stats for dynamic price classification ─────────────────────────
+        price_series = all_prices_raw if len(all_prices_raw) >= 8 else list(price_by_hour.values())
+        temps_list   = [fc.get("temperature", 0) for fc in fc_by_hour.values() if fc.get("temperature") is not None]
+        t_mean       = sum(temps_list) / len(temps_list) if temps_list else None
+
+        # ── Build plan slots ───────────────────────────────────────────────
+        plan = []
+        heat_curve = float(self._live.get("heat_curve") or 0)
+        outdoor    = float(self.state.get("last_outdoor_temp") or 0)
+
+        for h in range(lookahead):
+            slot_time = now + timedelta(hours=h)
+            fc_slot   = fc_by_hour.get(h, {})
+            price     = price_by_hour.get(h)
+
+            # Dynamic price level using full 48h distribution
+            price_level = classify_price(price, cfg, price_series) if price is not None else None
+
+            # Base price offset
+            price_offset = price_to_offset(price_level, cfg) if price_level else 0.0
+
+            # Solar bonus: good solar ahead → cheaper effective hour → shift offset up slightly
+            solar_offset = 0.0
+            solar_frac   = 0.0
+            if solar_enabled and fc_slot:
+                solar_frac = solar_fraction(fc_slot)
+                est_kwh    = round(solar_frac * peak_kwh, 2)
+                # High solar output = we can afford to heat more during that hour
+                # Weight it as a fraction of the VERY_CHEAP offset
+                solar_bonus = solar_frac * cfg.get("price_very_cheap", 2.0) * solar_weight
+                solar_offset = round(solar_bonus, 2)
+
+            # Battery coverage: if battery is well-charged, night hours become cheaper
+            batt_offset = 0.0
+            if solar_enabled and battery_soc is not None and fc_slot:
+                # Battery helps mostly at night (uv_index == 0)
+                uv = float(fc_slot.get("uv_index") or 0)
+                if uv == 0:  # nighttime
+                    batt_cov = battery_coverage(battery_soc)
+                    batt_bonus = batt_cov * cfg.get("price_very_cheap", 2.0) * battery_weight
+                    batt_offset = round(batt_bonus, 2)
+
+            # Pre-heat logic: look ahead for expensive windows
+            preheat_offset = 0.0
+            if price is not None and price_series:
+                future_prices = [price_by_hour[h2] for h2 in range(h+1, min(h+1+preheat_h, lookahead))
+                                 if h2 in price_by_hour]
+                if future_prices:
+                    future_level = classify_price(max(future_prices), cfg, price_series)
+                    if future_level in ("EXPENSIVE", "VERY_EXPENSIVE"):
+                        current_level = classify_price(price, cfg, price_series)
+                        if current_level in ("VERY_CHEAP", "CHEAP", "NORMAL"):
+                            # Pre-heat now before the expensive window
+                            preheat_offset = round(
+                                cfg.get("price_cheap", 1.0) * (1.5 if future_level == "VERY_EXPENSIVE" else 1.0), 1)
+
+            # Weather offset for this forecast slot
+            weather_offset = 0.0
+            if fc_slot.get("temperature") is not None and heat_curve > 0:
+                weather_offset = calc_weather_offset(
+                    outdoor, float(fc_slot["temperature"]), heat_curve,
+                    float(cfg.get("weather_adjust_factor", 0)),
+                    cfg.get("weather_enable_up", True),
+                    cfg.get("weather_enable_down", True))
+
+            # Combine: weather + price + solar + battery + preheat
+            combined = round(max(-10.0, min(10.0,
+                weather_offset + price_offset + solar_offset + batt_offset + preheat_offset)), 1)
+
+            # Build human-readable action annotations
+            actions = []
+            if price_level in ("VERY_CHEAP", "CHEAP"):
+                actions.append(f"Cheap: {price:.4f} ({price_level.replace('_',' ')})")
+            elif price_level in ("EXPENSIVE", "VERY_EXPENSIVE"):
+                actions.append(f"Expensive: {price:.4f} ({price_level.replace('_',' ')})" if price else "")
+            if preheat_offset > 0:
+                actions.append(f"Pre-heat +{preheat_offset}°C before {future_level.replace('_',' ').lower()}")
+            if solar_enabled and solar_frac > 0.3:
+                actions.append(f"Solar ~{round(solar_frac*peak_kwh,1)}kWh")
+            if solar_enabled and batt_offset > 0:
+                actions.append(f"Battery {battery_soc:.0f}% covers night")
+            if fc_slot.get("temperature") is not None and t_mean is not None:
+                temp = float(fc_slot["temperature"])
+                if temp < t_mean - 2:   actions.append(f"Cold: {temp:.1f}°C")
+                elif temp > t_mean + 2: actions.append(f"Warm: {temp:.1f}°C")
+
+            plan.append({
+                "hour_offset":        h,
+                "ts":                 int(slot_time.timestamp()),
+                "temp":               fc_slot.get("temperature"),
+                "uv_index":           fc_slot.get("uv_index"),
+                "cloud_coverage":     fc_slot.get("cloud_coverage"),
+                "price":              round(price, 4) if price else None,
+                "price_level":        price_level,
+                "weather_plan_offset": round(weather_offset, 2),
+                "price_plan_offset":   round(price_offset,   2),
+                "solar_offset":        round(solar_offset,   2),
+                "battery_offset":      round(batt_offset,    2),
+                "preheat_offset":      round(preheat_offset, 2),
+                "solar_fraction":      round(solar_frac,     2),
+                "combined_plan_offset": combined,
+                "actions":            [a for a in actions if a],
+            })
+
+        self._plan = plan
+        self.logger.info(
+            f"Planning: {len(plan)}-slot plan | "
+            f"price:{len(price_by_hour)}h ({len(price_series)} raw pts) | "
+            f"weather:{len(fc_by_hour)}h | "
+            f"solar:{'on' if solar_enabled else 'off'} | "
+            f"battery:{f'{battery_soc:.0f}%' if battery_soc is not None else 'n/a'}"
+        )
 
     async def _apply_loop(self):
         await asyncio.sleep(60)
@@ -373,6 +606,7 @@ class NibeController:
             "last_forecast_temp":   s.get("last_forecast_temp"),
             "last_price":           s.get("last_price"),
             "dry_run": bool(self.cfg.get("dry_run", True)),
+            "planning_enabled": bool(self.cfg.get("planning_enabled", True)),
             **self._live,
         }
 
@@ -390,6 +624,7 @@ class WebApp:
         app.router.add_get("/api/config",   self._config_get)
         app.router.add_post("/api/config",  self._config_post)
         app.router.add_get("/api/entities", self._entities)
+        app.router.add_get("/api/plan",     self._plan_api)
         return app
 
     async def _index(self, req: web.Request) -> web.Response:
@@ -412,10 +647,12 @@ class WebApp:
                       "indoor_factor","price_very_cheap","price_cheap","price_normal",
                       "price_expensive","price_very_expensive","price_very_cheap_threshold",
                       "price_cheap_threshold","price_expensive_threshold",
-                      "price_very_expensive_threshold","min_write_interval_min"]:
+                      "price_very_expensive_threshold","min_write_interval_min",
+                      "planning_lookahead_hours","price_preheat_hours",
+                      "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
-                      "indoor_enabled","price_enabled","dry_run"]:
+                      "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled"]:
                 if k in body: body[k] = bool(body[k])
             self.ctrl.cfg.update(body)
             save_json(CONFIG_FILE, self.ctrl.cfg)
@@ -426,6 +663,9 @@ class WebApp:
     async def _entities(self, req):
         domain = req.rel_url.query.get("domain", "")
         return web.json_response(await self.ctrl.ha.list_entities(domain))
+
+    async def _plan_api(self, req):
+        return web.json_response(self.ctrl._plan)
 
     async def start(self, port=8099):
         runner = web.AppRunner(self.build())
@@ -899,6 +1139,39 @@ function SettingsTab() {
         h(NumField, {label:'Very Expensive ≥', value:cfg.price_very_expensive_threshold, min:0, step:0.01, onChange:v=>set('price_very_expensive_threshold',v)}),
       ),
 
+      h(SectionHead, {title:'Solar & Battery'}),
+      h('div', {style:{background:'rgba(246,210,74,.06)',border:'1px solid rgba(246,210,74,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14}},
+        h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
+          'When enabled, solar production and battery state-of-charge are factored into the plan. ',
+          'Hours with high expected solar output are treated as cheaper. ',
+          'Battery coverage reduces the effective cost of night hours. ',
+          h('strong',{style:{color:'#f6d24a'}},'Solar and battery are weighted lower than the raw electricity price.')
+        ),
+        h(Toggle, {label:'Enable solar & battery planning', checked:!!cfg.solar_enabled, onChange:v=>set('solar_enabled',v)}),
+        h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
+          h(EntityInput, {label:'Battery SoC entity', name:'battery_entity', value:cfg.battery_entity||'', onChange:v=>set('battery_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_battery_capacity'}),
+          h(NumField, {label:'Solar peak output (kWh)', value:cfg.solar_peak_kwh||10, min:1, max:50, step:0.5, hint:'Max production on a perfect sunny day', onChange:v=>set('solar_peak_kwh',v)}),
+          h(NumField, {label:'Solar weight (0–1)', value:cfg.solar_weight||0.4, min:0.1, max:1, step:0.1, hint:'Influence vs price (lower = less weight)', onChange:v=>set('solar_weight',v)}),
+          h(NumField, {label:'Battery weight (0–1)', value:cfg.battery_weight||0.3, min:0.1, max:1, step:0.1, hint:'Influence of battery charge on night hours', onChange:v=>set('battery_weight',v)}),
+          h(NumField, {label:'Min useful SoC (%)', value:cfg.battery_useful_soc_min||20, min:5, max:50, step:5, hint:'Reserve % not counted as available', onChange:v=>set('battery_useful_soc_min',v)}),
+        )
+      ),
+
+      h(SectionHead, {title:'Planning (24h lookahead)'}),
+      h('div', {style:{background:'rgba(58,130,247,.06)',border:'1px solid rgba(58,130,247,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14}},
+        h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
+          'The planner fetches the full 48h Nordpool price schedule and weather forecast. ',
+          h('strong',{style:{color:'#3a82f7'}},'Price thresholds are dynamic — '),
+          'classified relative to the 48h distribution so the addon automatically adapts between summer and winter pricing. ',
+          'It also pre-heats before expensive windows and cold spells.'
+        ),
+        h(Toggle, {label:'Enable 24h planning', checked:!!cfg.planning_enabled, onChange:v=>set('planning_enabled',v)}),
+        h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
+          h(NumField, {label:'Lookahead hours', value:cfg.planning_lookahead_hours||24, min:6, max:48, step:1, hint:'How many hours ahead to plan (6–48)', onChange:v=>set('planning_lookahead_hours',v)}),
+          h(NumField, {label:'Pre-heat lead time (hours)', value:cfg.price_preheat_hours||2, min:1, max:6, step:1, hint:'Hours before expensive window to start pre-heating', onChange:v=>set('price_preheat_hours',v)}),
+        )
+      ),
+
       h(SectionHead, {title:'Dry Run'}),
       h('div', {style:{background:'rgba(246,210,74,.06)',border:'1px solid rgba(246,210,74,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14}},
         h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
@@ -931,6 +1204,179 @@ function NavBtn({label, active, onClick}) {
   }, label);
 }
 
+
+// ── Planning tab ──────────────────────────────────────────────────────────────
+function PriceLevelDot({level}) {
+  const c = {VERY_CHEAP:'#2ec27e',CHEAP:'#a3e635',NORMAL:'#7b87a8',EXPENSIVE:'#f6d24a',VERY_EXPENSIVE:'#e05c2a'};
+  return h('div', {style:{width:10,height:10,borderRadius:'50%',background:c[level]||'#2a3050',flexShrink:0,marginTop:2}});
+}
+
+function PlanningTab({status, cfg}) {
+  const [plan,  setPlan]  = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    GET('api/plan')
+      .then(p => { setPlan(p); setError(null); })
+      .catch(e => setError(e.message));
+  }, []);
+
+  if (error) return h(Card, null, h('div', {style:{color:'#e05c2a',fontSize:13}}, 'Error loading plan: ', error));
+  if (plan === null) return h('div', {style:{color:'#7b87a8',padding:20}}, 'Loading plan…');
+  if (!plan.length) return h(Card, null,
+    h('div', {style:{color:'#7b87a8',fontSize:13,lineHeight:1.8}},
+      'No plan available yet — the planner runs once per hour.',h('br'),
+      'Make sure your weather entity (weather.openweathermap) and electricity price entity are configured in Settings.',h('br'),
+      'The planner will generate its first plan within 90 seconds of startup.'
+    )
+  );
+
+  const now = Date.now() / 1000;
+
+  // Find min/max for scale
+  const allOffsets = plan.map(s => s.combined_plan_offset).filter(v => v != null);
+  const allTemps   = plan.map(s => s.temp).filter(v => v != null);
+  const allPrices  = plan.map(s => s.price).filter(v => v != null);
+  const maxAbsOff  = Math.max(1, ...allOffsets.map(Math.abs));
+  const tMin = allTemps.length  ? Math.min(...allTemps)  : 0;
+  const tMax = allTemps.length  ? Math.max(...allTemps)  : 30;
+  const pMin = allPrices.length ? Math.min(...allPrices) : 0;
+  const pMax = allPrices.length ? Math.max(...allPrices) : 0.3;
+
+  const barW = (v, maxAbs) => Math.max(2, Math.round(Math.abs(v) / maxAbs * 120));
+  const tempBar = t => t == null ? 0 : Math.round((t - tMin) / Math.max(0.1, tMax - tMin) * 80);
+  const priceBar = p => p == null ? 0 : Math.round((p - pMin) / Math.max(0.001, pMax - pMin) * 80);
+
+  return h('div', null,
+    // Summary cards
+    h('div', {style:{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:14,marginBottom:14}},
+      h(Card, {title:'Cheapest window (next 24h)'},
+        (() => {
+          const cheapSlot = [...plan].filter(s=>s.price!=null).sort((a,b)=>a.price-b.price)[0];
+          if (!cheapSlot) return h('div',{style:{color:'#7b87a8',fontSize:13}},'No price data');
+          const dt = new Date(cheapSlot.ts*1000);
+          return h('div', null,
+            h('div',{style:{fontFamily:'ui-monospace,monospace',fontSize:22,fontWeight:700,color:'#2ec27e'}},
+              `€${cheapSlot.price.toFixed(4)}`),
+            h('div',{style:{fontSize:12,color:'#7b87a8',marginTop:4}},
+              dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) +
+              ' in +' + cheapSlot.hour_offset + 'h'),
+            h('div',{style:{fontSize:12,color:'#7b87a8'}}, 'Planned: '+
+              (cheapSlot.combined_plan_offset>0?'+':'')+cheapSlot.combined_plan_offset+'°C')
+          );
+        })()
+      ),
+      h(Card, {title:'Most expensive window'},
+        (() => {
+          const expSlot = [...plan].filter(s=>s.price!=null).sort((a,b)=>b.price-a.price)[0];
+          if (!expSlot) return h('div',{style:{color:'#7b87a8',fontSize:13}},'No price data');
+          const dt = new Date(expSlot.ts*1000);
+          return h('div', null,
+            h('div',{style:{fontFamily:'ui-monospace,monospace',fontSize:22,fontWeight:700,color:'#e05c2a'}},
+              `€${expSlot.price.toFixed(4)}`),
+            h('div',{style:{fontSize:12,color:'#7b87a8',marginTop:4}},
+              dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) +
+              ' in +' + expSlot.hour_offset + 'h'),
+            h('div',{style:{fontSize:12,color:'#7b87a8'}}, 'Planned: '+
+              (expSlot.combined_plan_offset>0?'+':'')+expSlot.combined_plan_offset+'°C')
+          );
+        })()
+      ),
+      h(Card, {title:'Coldest window'},
+        (() => {
+          const coldSlot = [...plan].filter(s=>s.temp!=null).sort((a,b)=>a.temp-b.temp)[0];
+          if (!coldSlot) return h('div',{style:{color:'#7b87a8',fontSize:13}},'No temp data');
+          const dt = new Date(coldSlot.ts*1000);
+          return h('div', null,
+            h('div',{style:{fontFamily:'ui-monospace,monospace',fontSize:22,fontWeight:700,color:'#3a82f7'}},
+              coldSlot.temp.toFixed(1)+'°C'),
+            h('div',{style:{fontSize:12,color:'#7b87a8',marginTop:4}},
+              dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) +
+              ' in +' + coldSlot.hour_offset + 'h'),
+            h('div',{style:{fontSize:12,color:'#7b87a8'}}, 'Planned: '+
+              (coldSlot.combined_plan_offset>0?'+':'')+coldSlot.combined_plan_offset+'°C')
+          );
+        })()
+      )
+    ),
+
+    // Timeline
+    h(Card, {title:'24h hourly plan'},
+      h('div', {style:{overflowX:'auto'}},
+        h('div', {style:{minWidth:700}},
+          // Header
+          h('div', {style:{display:'grid',gridTemplateColumns:'60px 1fr 90px 100px 60px 60px 1fr',gap:8,padding:'0 0 8px',borderBottom:'1px solid #2a3050',fontSize:10,textTransform:'uppercase',letterSpacing:'.07em',color:'#7b87a8',marginBottom:4}},
+            h('div',null,'Time'),
+            h('div',null,'Planned offset'),
+            h('div',null,'Temp'),
+            h('div',null,'Price'),
+            h('div',null,'Solar'),
+            h('div',null,'Batt'),
+            h('div',null,'Actions')
+          ),
+          plan.map((slot, i) => {
+            const dt   = new Date(slot.ts * 1000);
+            const past = slot.ts < now - 60;
+            const curr = !past && (i === 0 || plan[i-1].ts < now);
+            const timeStr = dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+
+            return h('div', {key:i, style:{
+              display:'grid', gridTemplateColumns:'60px 1fr 90px 100px 70px 70px 150px',
+              gap:8, padding:'5px 0', borderBottom:'1px solid #1f2436',
+              alignItems:'center', opacity: past ? 0.4 : 1,
+              background: curr ? 'rgba(224,92,42,.06)' : 'transparent',
+            }},
+              // Time
+              h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:12,color:curr?'#e05c2a':'#7b87a8',fontWeight:curr?700:400}},
+                timeStr, curr && h('div',{style:{fontSize:9,color:'#e05c2a',fontWeight:700}},'NOW')
+              ),
+              // Offset bar
+              h('div', {style:{display:'flex',alignItems:'center',gap:6}},
+                h('div', {style:{
+                  width: barW(slot.combined_plan_offset, maxAbsOff),
+                  height:8, borderRadius:3,
+                  background: slot.combined_plan_offset > 0 ? '#f7953a' : slot.combined_plan_offset < 0 ? '#3a82f7' : '#2a3050',
+                  marginLeft: slot.combined_plan_offset >= 0 ? 60 : (60 - barW(slot.combined_plan_offset, maxAbsOff)),
+                  transition:'width .3s',
+                }}),
+                h('span',{style:{fontFamily:'ui-monospace,monospace',fontSize:11,color:slot.combined_plan_offset>0?'#f7953a':slot.combined_plan_offset<0?'#3a82f7':'#7b87a8',minWidth:40}},
+                  (slot.combined_plan_offset>0?'+':'')+slot.combined_plan_offset.toFixed(1)+'°C')
+              ),
+              // Temp
+              h('div', {style:{display:'flex',alignItems:'center',gap:5}},
+                slot.temp != null && h('div',{style:{width:tempBar(slot.temp),height:4,borderRadius:2,background:'#3a82f755',flexShrink:0}}),
+                h('span',{style:{fontSize:11,color:'#7b87a8'}}, slot.temp != null ? slot.temp.toFixed(1)+'°C' : '—')
+              ),
+              // Price
+              h('div', {style:{display:'flex',alignItems:'center',gap:5}},
+                slot.price != null && h(PriceLevelDot, {level:slot.price_level}),
+                h('span',{style:{fontSize:11,color:'#7b87a8'}}, slot.price != null ? '€'+slot.price.toFixed(4) : '—')
+              ),
+              // Solar
+              h('div', {style:{fontSize:11,color: slot.solar_fraction > 0.5 ? '#f6d24a' : '#7b87a8'}},
+                slot.solar_fraction > 0 ? `${Math.round(slot.solar_fraction*100)}%` : '—'
+              ),
+              // Battery
+              h('div', {style:{fontSize:11,color: slot.battery_offset > 0 ? '#2ec27e' : '#7b87a8'}},
+                slot.battery_offset > 0 ? `+${slot.battery_offset}` : '—'
+              ),
+              // Actions
+              h('div', {style:{fontSize:10,color:'#e05c2a',lineHeight:1.5}},
+                (slot.actions||[]).join(' · ') || ''
+              )
+            );
+          })
+        )
+      )
+    ),
+
+    // Settings hint
+    h('div', {style:{fontSize:12,color:'#7b87a8',padding:'4px 2px'}},
+      'Planning runs hourly. Preheat lead time and lookahead are configurable in Settings.'
+    )
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App() {
   const [tab,    setTab]    = useState('dashboard');
@@ -958,6 +1404,7 @@ function App() {
     {id:'dashboard', label:'Dashboard'},
     {id:'history',   label:'History'},
     {id:'charts',    label:'Charts'},
+    {id:'planning',  label:'Planning'},
     {id:'settings',  label:'Settings'},
   ];
 
@@ -984,6 +1431,7 @@ function App() {
       tab === 'dashboard' && h(DashboardTab, {status, cfg}),
       tab === 'history'   && h(HistoryTab),
       tab === 'charts'    && h(ChartsTab),
+      tab === 'planning'  && h(PlanningTab, {status, cfg}),  // pass status for battery display
       tab === 'settings'  && h(SettingsTab),
     )
   );
