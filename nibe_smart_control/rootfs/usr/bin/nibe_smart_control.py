@@ -41,9 +41,9 @@ DEFAULT_CONFIG = {
     "min_write_interval_min": MIN_WRITE_INTERVAL, "dry_run": True,
     "planning_enabled": True, "planning_lookahead_hours": 24,
     "price_preheat_hours": 2,
-    "solar_enabled": False, "solar_peak_kwh": 10.0,
+    "solar_enabled": False, "solar_entity": "", "solar_peak_kwh": 10.0,
     "solar_weight": 0.4, "battery_entity": "", "battery_weight": 0.3,
-    "battery_useful_soc_min": 20.0,
+    "battery_useful_soc_min": 20.0, "indoor_gate_dead_band": 0.5,
     "log_level": "info",
 }
 
@@ -357,15 +357,31 @@ class NibeController:
         # Formula: solar_fraction = uv_index/11 * (1 - cloud_coverage/100) * 0.85
         # This is intentionally approximate — weighted down vs price anyway.
         solar_enabled  = cfg.get("solar_enabled", False)
+        solar_entity   = cfg.get("solar_entity", "")
         peak_kwh       = float(cfg.get("solar_peak_kwh", 10.0))
         solar_weight   = float(cfg.get("solar_weight", 0.4))
         battery_weight = float(cfg.get("battery_weight", 0.3))
         batt_soc_min   = float(cfg.get("battery_useful_soc_min", 20.0))
 
+        # Read current solar output from user-specified entity (W or kWh sensor)
+        current_solar_frac = 0.0
+        if solar_enabled and solar_entity:
+            sol_val = await self.ha.get_float(solar_entity)
+            if sol_val is not None and peak_kwh > 0:
+                # Accept both W (e.g. 3500 W) and kWh (e.g. 3.5 kWh) sensors
+                # Heuristic: if value > 100, assume it's in W, else kWh
+                if sol_val > 100:
+                    sol_kwh = sol_val / 1000.0   # W → kWh equivalent
+                else:
+                    sol_kwh = sol_val
+                current_solar_frac = min(1.0, max(0.0, sol_kwh / peak_kwh))
+                self._live["solar_fraction"] = round(current_solar_frac, 2)
+                self._live["solar_kwh"] = round(sol_kwh, 2)
+
+        # For per-slot planning: solar fraction is uniform (current reading).
+        # A user with a Solcast-type forecast sensor could extend this later.
         def solar_fraction(fc_slot: dict) -> float:
-            uv  = float(fc_slot.get("uv_index") or 0)
-            cc  = float(fc_slot.get("cloud_coverage") or 0)
-            return min(1.0, max(0.0, (uv / 11.0) * (1.0 - cc / 100.0) * 0.85))
+            return current_solar_frac
 
         def battery_coverage(soc: float) -> float:
             """0.0–1.0 — how much useful battery reserve exists above minimum."""
@@ -439,8 +455,22 @@ class NibeController:
                     cfg.get("weather_enable_down", True))
 
             # Combine: weather + price + solar + battery + preheat
+            # Gate positive contributions if indoor is currently above setpoint
+            w_slot = weather_offset
+            p_slot = price_offset + preheat_offset
+            if (cfg.get("indoor_enabled") and indoor_temp is not None
+                    and indoor_set is not None):
+                dead_band_plan = float(cfg.get("indoor_gate_dead_band", 0.5))
+                overshoot = indoor_temp - indoor_set - dead_band_plan
+                if overshoot > 0:
+                    gf = max(0.0, 1.0 - overshoot / 2.0)
+                    if w_slot > 0: w_slot = round(w_slot * gf, 2)
+                    if p_slot > 0: p_slot = round(p_slot * gf, 2)
+                    if solar_offset > 0: solar_offset = round(solar_offset * gf, 2)
+                    if batt_offset > 0:  batt_offset  = round(batt_offset  * gf, 2)
+
             combined = round(max(-10.0, min(10.0,
-                weather_offset + price_offset + solar_offset + batt_offset + preheat_offset)), 1)
+                w_slot + p_slot + solar_offset + batt_offset)), 1)
 
             # Build human-readable action annotations
             actions = []
@@ -547,6 +577,30 @@ class NibeController:
         w   = float(s.get("weather_offset") or 0)
         ind = float(s.get("indoor_offset")  or 0)
         p   = float(s.get("price_offset")   or 0)
+
+        # ── Indoor gate: if house is above setpoint, suppress positive offsets
+        # proportionally. The further above setpoint, the more we suppress.
+        # dead_band = tolerance before gate activates (default 0.5°C)
+        indoor_temp    = s.get("last_indoor_temp")
+        indoor_set     = s.get("last_indoor_setpoint")
+        dead_band      = float(cfg.get("indoor_gate_dead_band", 0.5))
+        gate_factor    = 1.0  # 1.0 = no suppression
+        if (cfg.get("indoor_enabled") and indoor_temp is not None
+                and indoor_set is not None and indoor_temp > indoor_set + dead_band):
+            # How far above setpoint+dead_band (in °C)
+            overshoot = indoor_temp - indoor_set - dead_band
+            # Linearly suppress positive contributions: 0 at dead_band, full at dead_band+2°C
+            gate_factor = max(0.0, 1.0 - overshoot / 2.0)
+            # Apply gate to weather and price (only suppress positive parts)
+            w_gated = min(w, w * gate_factor) if w > 0 else w
+            p_gated = min(p, p * gate_factor) if p > 0 else p
+            if gate_factor < 1.0:
+                self.logger.debug(
+                    f"Indoor gate: {indoor_temp:.1f}°C > {indoor_set:.1f}+{dead_band}°C "
+                    f"→ gate_factor={gate_factor:.2f} (weather {w:+.2f}→{w_gated:+.2f}, "
+                    f"price {p:+.2f}→{p_gated:+.2f})")
+            w, p = w_gated, p_gated
+
         combined = max(-10.0, min(10.0, round(w + ind + p, 1)))
         min_interval = float(cfg.get("min_write_interval_min", MIN_WRITE_INTERVAL)) * 60
         elapsed = time.time() - (s.get("last_write_ts") or 0)
@@ -661,7 +715,8 @@ class WebApp:
                       "price_cheap_threshold","price_expensive_threshold",
                       "price_very_expensive_threshold","min_write_interval_min",
                       "planning_lookahead_hours","price_preheat_hours",
-                      "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min"]:
+                      "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min",
+                      "indoor_gate_dead_band"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
                       "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled"]:
@@ -1131,6 +1186,11 @@ function SettingsTab() {
         h(NumField, {label:'P-factor', value:cfg.indoor_factor, min:1, max:50, step:1, hint:'offset = (setpoint − actual) × factor. Default 10', onChange:v=>set('indoor_factor',v)}),
       ),
       h(Toggle, {label:'Enable indoor temperature control', checked:!!cfg.indoor_enabled, onChange:v=>set('indoor_enabled',v)}),
+      cfg.indoor_enabled && h('div', {style:{maxWidth:300,marginTop:10}},
+        h(NumField, {label:'Gate dead band (°C)', value:cfg.indoor_gate_dead_band!=null?cfg.indoor_gate_dead_band:0.5, min:0, max:3, step:0.25,
+          hint:'If indoor exceeds setpoint by this much, heating offsets are suppressed. 0 = strict, 0.5 = recommended.',
+          onChange:v=>set('indoor_gate_dead_band',v)})
+      ),
 
       h(SectionHead, {title:'Electricity price'}),
       h(EntityInput, {label:'Price sensor', name:'electricity_price_entity', value:cfg.electricity_price_entity, onChange:v=>set('electricity_price_entity',v), domains:['sensor']}),
@@ -1154,18 +1214,18 @@ function SettingsTab() {
       h(SectionHead, {title:'Solar & Battery'}),
       h('div', {style:{background:'rgba(246,210,74,.06)',border:'1px solid rgba(246,210,74,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14}},
         h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
-          'When enabled, solar production and battery state-of-charge are factored into the plan. ',
-          'Hours with high expected solar output are treated as cheaper. ',
-          'Battery coverage reduces the effective cost of night hours. ',
+          'Point to any HA sensor that represents current solar output — W or kWh, the addon detects the unit automatically. ',
+          'Hours with high solar output are treated as effectively cheaper to run the pump. ',
           h('strong',{style:{color:'#f6d24a'}},'Solar and battery are weighted lower than the raw electricity price.')
         ),
         h(Toggle, {label:'Enable solar & battery planning', checked:!!cfg.solar_enabled, onChange:v=>set('solar_enabled',v)}),
         h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
+          h(EntityInput, {label:'Solar output sensor', name:'solar_entity', value:cfg.solar_entity||'', onChange:v=>set('solar_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_measured_power (W) or sensor.solax_today_s_solar_energy (kWh)'}),
           h(EntityInput, {label:'Battery SoC entity', name:'battery_entity', value:cfg.battery_entity||'', onChange:v=>set('battery_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_battery_capacity'}),
-          h(NumField, {label:'Solar peak output (kWh)', value:cfg.solar_peak_kwh||10, min:1, max:50, step:0.5, hint:'Max production on a perfect sunny day', onChange:v=>set('solar_peak_kwh',v)}),
-          h(NumField, {label:'Solar weight (0–1)', value:cfg.solar_weight||0.4, min:0.1, max:1, step:0.1, hint:'Influence vs price (lower = less weight)', onChange:v=>set('solar_weight',v)}),
-          h(NumField, {label:'Battery weight (0–1)', value:cfg.battery_weight||0.3, min:0.1, max:1, step:0.1, hint:'Influence of battery charge on night hours', onChange:v=>set('battery_weight',v)}),
-          h(NumField, {label:'Min useful SoC (%)', value:cfg.battery_useful_soc_min||20, min:5, max:50, step:5, hint:'Reserve % not counted as available', onChange:v=>set('battery_useful_soc_min',v)}),
+          h(NumField, {label:'Solar peak output (kWh)', value:cfg.solar_peak_kwh||10, min:1, max:50, step:0.5, hint:'Your system peak on a perfect sunny day', onChange:v=>set('solar_peak_kwh',v)}),
+          h(NumField, {label:'Solar weight (0–1)', value:cfg.solar_weight||0.4, min:0.1, max:1, step:0.1, hint:'How much solar shifts the effective price', onChange:v=>set('solar_weight',v)}),
+          h(NumField, {label:'Battery weight (0–1)', value:cfg.battery_weight||0.3, min:0.1, max:1, step:0.1, hint:'Influence of battery SoC on night-time scoring', onChange:v=>set('battery_weight',v)}),
+          h(NumField, {label:'Min useful SoC (%)', value:cfg.battery_useful_soc_min||20, min:5, max:50, step:5, hint:'Reserve % kept for outages — not counted as available', onChange:v=>set('battery_useful_soc_min',v)}),
         )
       ),
 
