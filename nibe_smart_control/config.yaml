@@ -1,6 +1,6 @@
 name: "Nibe Smart Control"
 description: "Intelligent heat curve control for Nibe F-series heat pumps. Adjusts heating based on weather forecast, indoor temperature and electricity price. Includes a web dashboard with history and charts."
-version: "1.2.7"
+version: "1.2.9"
 slug: "nibe_smart_control"
 init: false
 arch:
