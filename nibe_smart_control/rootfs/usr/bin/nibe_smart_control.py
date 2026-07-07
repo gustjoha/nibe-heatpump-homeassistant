@@ -311,6 +311,14 @@ class NibeController:
         preheat_h = int(cfg.get("price_preheat_hours", 2))
         now       = datetime.now(timezone.utc)
 
+        # Current indoor state for the gate (read from controller state, which
+        # the indoor loop refreshes every 5 min; falls back to configured
+        # target if no setpoint entity is set — mirrors _run_indoor behaviour)
+        indoor_temp = self.state.get("last_indoor_temp")
+        indoor_set  = self.state.get("last_indoor_setpoint")
+        if indoor_set is None and cfg.get("indoor_enabled"):
+            indoor_set = float(cfg.get("indoor_target_temp", 21.0))
+
         # ── Fetch weather forecast (temp + UV + cloud per hour) ────────────
         forecasts = await self.ha.get_weather_forecast(cfg.get("weather_entity", ""))
         fc_by_hour: dict = {}  # h_offset -> full forecast dict
