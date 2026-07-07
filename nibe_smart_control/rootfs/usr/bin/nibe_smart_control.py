@@ -44,6 +44,10 @@ DEFAULT_CONFIG = {
     "solar_enabled": False, "solar_entity": "", "solar_peak_kwh": 10.0,
     "solar_weight": 0.4, "battery_entity": "", "battery_weight": 0.3,
     "battery_useful_soc_min": 20.0, "indoor_gate_dead_band": 0.5,
+    "max_step_per_write": 3.0,
+    "prio_entity": "", "compressor_status_entity": "",
+    "int_add_power_entity": "",
+    "compressor_rated_kw": 1.7, "pump_overhead_kw": 0.12,
     "log_level": "info",
 }
 
@@ -100,6 +104,19 @@ class HAClient:
                 raw = s.get("state")
                 if raw in (None, "unavailable", "unknown", ""): return None
                 return float(raw)
+        except Exception: return None
+
+    async def get_state_raw(self, entity_id: str) -> Optional[str]:
+        if not entity_id: return None
+        url = f"{self.base}/states/{entity_id}"
+        try:
+            async with self.session.get(url, headers=self.headers,
+                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return None
+                s = await r.json()
+                raw = s.get("state")
+                if raw in (None, "unavailable", "unknown", ""): return None
+                return str(raw)
         except Exception: return None
 
     async def set_number(self, entity_id: str, value: float) -> bool:
@@ -521,7 +538,45 @@ class NibeController:
         while True:
             try: await self._apply()
             except Exception as e: self.logger.error(f"apply: {e}")
+            try: await self._update_power_estimate()
+            except Exception as e: self.logger.debug(f"power est: {e}")
             await asyncio.sleep(60)
+
+    async def _update_power_estimate(self):
+        """Estimate heat pump electrical power from compressor status +
+        immersion heater register. F1245-8 is fixed speed: compressor either
+        draws its rated input (~1.7 kW at 0/35) or nothing. Pump overhead
+        (brine GP2 + heating medium GP1) only applies while the compressor runs."""
+        cfg = self.cfg
+        cpr_ent = cfg.get("compressor_status_entity", "")
+        add_ent = cfg.get("int_add_power_entity", "")
+        if not cpr_ent and not add_ent:
+            self._live.pop("est_power_kw", None)
+            self._live.pop("compressor_on", None)
+            return
+        comp_on = None
+        if cpr_ent:
+            raw = await self.ha.get_state_raw(cpr_ent)
+            if raw is not None:
+                comp_on = raw.lower() in ("on", "true", "1", "running")
+        add_kw = await self.ha.get_float(add_ent) if add_ent else None
+        rated = float(cfg.get("compressor_rated_kw", 1.7))
+        pumps = float(cfg.get("pump_overhead_kw", 0.12))
+        total = 0.0
+        if comp_on:
+            total += rated + pumps
+        if add_kw:
+            total += add_kw
+        if comp_on is not None:
+            self._live["compressor_on"] = comp_on
+        if comp_on is not None or add_kw is not None:
+            self._live["est_power_kw"] = round(total, 2)
+        if add_kw is not None:
+            self._live["int_add_kw"] = round(add_kw, 2)
+        prio_ent = cfg.get("prio_entity", "")
+        if prio_ent:
+            prio = await self.ha.get_state_raw(prio_ent)
+            if prio: self._live["prio"] = prio
 
     async def _run_weather(self):
         cfg = self.cfg
@@ -605,9 +660,36 @@ class NibeController:
         min_interval = float(cfg.get("min_write_interval_min", MIN_WRITE_INTERVAL)) * 60
         elapsed = time.time() - (s.get("last_write_ts") or 0)
         last    = s.get("last_combined_offset")
+
+        # ── Slew limit: never move the offset more than max_step_per_write in
+        # a single write. F1245 menu 5.1.3 ("max diff flow line temp", default
+        # 10°C) forces DM to +2 and stops the compressor if the actual supply
+        # exceeds the calculated supply by that amount. One offset step ≈ 2.5°C
+        # of calculated supply, so a swing > 4 steps could hard-stop the
+        # compressor mid-cycle. Default limit of 3 steps ≈ 7.5°C stays safely
+        # under the trip wire while still reacting within 2-3 write cycles.
+        max_step = float(cfg.get("max_step_per_write", 3.0))
+        if last is not None and abs(combined - last) > max_step:
+            slewed = last + max_step if combined > last else last - max_step
+            self.logger.info(
+                f"Slew limit: target {combined:+.1f} clamped to {slewed:+.1f} "
+                f"(max {max_step:.1f} steps/write, protects against 5.1.3 trip)")
+            combined = round(slewed, 1)
+
         delta   = abs(combined - last) if last is not None else 999
         if delta < 0.2: return
         if delta < 0.5 and elapsed < min_interval: return
+
+        # ── Hot water priority guard: curve offset only affects space heating;
+        # during hot water production the pump runs fixed-condensing. Defer
+        # the write so it lands when it can actually take effect.
+        prio_entity = cfg.get("prio_entity", "")
+        if prio_entity and not dry_run:
+            prio = await self.ha.get_state_raw(prio_entity)
+            if prio and "hot water" in prio.lower():
+                self.logger.debug(f"Prio is '{prio}' — deferring offset write until HW cycle ends")
+                return
+
         offset_entity = cfg.get("curve_offset_entity", "")
         if not offset_entity and not dry_run: return
         reasons = self._build_reasons(w, ind, p, cfg, s)
@@ -716,7 +798,8 @@ class WebApp:
                       "price_very_expensive_threshold","min_write_interval_min",
                       "planning_lookahead_hours","price_preheat_hours",
                       "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min",
-                      "indoor_gate_dead_band"]:
+                      "indoor_gate_dead_band","max_step_per_write",
+                      "compressor_rated_kw","pump_overhead_kw"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
                       "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled"]:
@@ -1073,6 +1156,20 @@ function DashboardTab({status, cfg}) {
     h(Grid, {cols:2},
       h(Card, {title:'Indoor'}, h(Stat, {label:'Actual', value:fmtTemp(status.last_indoor_temp), note:status.last_indoor_setpoint!=null?'Setpoint → '+fmtTemp(status.last_indoor_setpoint):''})),
       h(Card, {title:'Rate limiting'}, h(Stat, {label:'Next write', value:rem!=null?(rem>0?`${Math.ceil(rem/60)} min`:'Ready'):'—', note:rem!=null&&rem>0?`${minInterval} min interval active`:''  }))
+    ),
+    (status.est_power_kw!=null || status.compressor_on!=null) && h(Grid, {cols:2},
+      h(Card, {title:'Compressor'}, h(Stat, {
+        label:'Status',
+        value: status.compressor_on==null ? '—' : (status.compressor_on ? 'Running' : 'Idle'),
+        valueColor: status.compressor_on ? '#2ec27e' : '#7b87a8',
+        note: status.prio ? 'Priority: '+status.prio : ''
+      })),
+      h(Card, {title:'Estimated power'}, h(Stat, {
+        label:'Electrical draw',
+        value: status.est_power_kw!=null ? status.est_power_kw.toFixed(2)+' kW' : '—',
+        valueColor: status.est_power_kw>0 ? '#f6a23a' : '#7b87a8',
+        note: status.int_add_kw>0 ? 'Immersion heater: '+status.int_add_kw.toFixed(1)+' kW' : 'Compressor + pumps model'
+      }))
     )
   );
 }
@@ -1161,6 +1258,22 @@ function SettingsTab() {
         h(EntityInput, {label:'Heat curve (read only)', name:'heat_curve_entity', value:cfg.heat_curve_entity, onChange:v=>set('heat_curve_entity',v), domains:['number']}),
         h('div', {style:{width:14}}),
         h(EntityInput, {label:'Curve offset — addon writes here', name:'curve_offset_entity', value:cfg.curve_offset_entity, onChange:v=>set('curve_offset_entity',v), domains:['number']}),
+      ),
+
+      h(SectionHead, {title:'Power & status monitoring (optional)'}),
+      h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:8}},
+        'From the official nibe_heatpump integration. Compressor status enables the live power estimate; priority defers curve writes during hot water production.'),
+      h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:0}},
+        h(EntityInput, {label:'Compressor status (e.g. binary_sensor.cpr_status_ep14_43435)', name:'compressor_status_entity', value:cfg.compressor_status_entity, onChange:v=>set('compressor_status_entity',v), domains:['binary_sensor','sensor']}),
+        h('div', {style:{width:14}}),
+        h(EntityInput, {label:'Priority (e.g. sensor.prio_43086)', name:'prio_entity', value:cfg.prio_entity, onChange:v=>set('prio_entity',v), domains:['sensor']}),
+        h('div', {style:{width:14}}),
+        h(EntityInput, {label:'Immersion heater power (e.g. sensor.int_el_add_power_43084)', name:'int_add_power_entity', value:cfg.int_add_power_entity, onChange:v=>set('int_add_power_entity',v), domains:['sensor']}),
+      ),
+      h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:0}},
+        h(NumField, {label:'Compressor rated draw (kW)', value:cfg.compressor_rated_kw, min:0.5, max:5, step:0.05, hint:'F1245-8: ~1.70 kW at 0/35', onChange:v=>set('compressor_rated_kw',v)}),
+        h('div', {style:{width:14}}),
+        h(NumField, {label:'Pump overhead (kW)', value:cfg.pump_overhead_kw, min:0, max:0.5, step:0.01, hint:'Brine + heating medium pumps while compressor runs', onChange:v=>set('pump_overhead_kw',v)}),
       ),
 
       h(SectionHead, {title:'Weather forecast'}),
@@ -1257,6 +1370,8 @@ function SettingsTab() {
       h(SectionHead, {title:'Rate limiting'}),
       h('div', {style:{maxWidth:260}}),
         h(NumField, {label:'Min minutes between writes', value:cfg.min_write_interval_min, min:5, max:120, step:5, hint:'Protects the heat pump compressor (5–120 min)', onChange:v=>set('min_write_interval_min',v)}),
+        h('div', {style:{width:14}}),
+        h(NumField, {label:'Max offset steps per write', value:cfg.max_step_per_write, min:1, max:10, step:0.5, hint:'1 step ≈ 2.5°C supply. Keep ≤ 3 to stay under the pump\u2019s 5.1.3 compressor-stop trip (10°C)', onChange:v=>set('max_step_per_write',v)}),
 
       h('div', {style:{marginTop:8,display:'flex',alignItems:'center',gap:12}},
         h('button', {
