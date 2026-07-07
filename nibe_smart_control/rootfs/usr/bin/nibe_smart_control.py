@@ -18,7 +18,9 @@ DATA_DIR     = Path("/data")
 CONFIG_FILE  = DATA_DIR / "config.json"
 STATE_FILE   = DATA_DIR / "state.json"
 HISTORY_FILE = DATA_DIR / "history.json"
+POWER_FILE   = DATA_DIR / "power_history.json"
 MAX_HISTORY  = 500
+MAX_POWER_SAMPLES = 2880  # 48h of 1-minute samples
 MIN_WRITE_INTERVAL = 10
 
 LOG_LEVEL_MAP = {"debug": logging.DEBUG, "info": logging.INFO,
@@ -251,6 +253,8 @@ class NibeController:
         self.cfg     = load_config()
         self.state   = load_state()
         self.history: List[dict] = load_json(HISTORY_FILE, [])
+        self.power_history: List[dict] = load_json(POWER_FILE, [])
+        self._power_save_counter = 0
         self.ha: Optional[HAClient] = None
         self._live: dict = {}
         self._plan: List[dict] = []  # 24h hourly plan slots
@@ -579,6 +583,27 @@ class NibeController:
             self._live["compressor_on"] = comp_on
         if comp_on is not None or add_kw is not None:
             self._live["est_power_kw"] = round(total, 2)
+            # ── Record 1-minute sample and integrate last 24h to kWh.
+            # Samples are 60s apart, so kWh ≈ Σ(kW) / 60 over the window.
+            now_ts = int(time.time())
+            self.power_history.append({
+                "ts": now_ts, "kw": round(total, 3),
+                "comp": bool(comp_on) if comp_on is not None else None,
+                "add": round(add_kw, 2) if add_kw is not None else None,
+            })
+            if len(self.power_history) > MAX_POWER_SAMPLES:
+                self.power_history = self.power_history[-MAX_POWER_SAMPLES:]
+            cutoff = now_ts - 24 * 3600
+            last24 = [p["kw"] for p in self.power_history if p["ts"] >= cutoff]
+            self._live["power_24h_kwh"] = round(sum(last24) / 60.0, 2)
+            comp_minutes = sum(1 for p in self.power_history
+                               if p["ts"] >= cutoff and p.get("comp"))
+            self._live["comp_runtime_24h_h"] = round(comp_minutes / 60.0, 1)
+            # Persist every 5 samples to limit flash wear
+            self._power_save_counter += 1
+            if self._power_save_counter >= 5:
+                self._power_save_counter = 0
+                save_json(POWER_FILE, self.power_history)
         if add_kw is not None:
             self._live["int_add_kw"] = round(add_kw, 2)
         prio_ent = cfg.get("prio_entity", "")
@@ -781,6 +806,7 @@ class WebApp:
         app.router.add_post("/api/config",  self._config_post)
         app.router.add_get("/api/entities", self._entities)
         app.router.add_get("/api/plan",     self._plan_api)
+        app.router.add_get("/api/power",    self._power_api)
         return app
 
     async def _index(self, req: web.Request) -> web.Response:
@@ -793,6 +819,14 @@ class WebApp:
     async def _history(self, req):
         n = int(req.rel_url.query.get("n", 200))
         return web.json_response(self.ctrl.history[-n:])
+
+    async def _power_api(self, req):
+        """Power samples (1/min). ?hours=24 window, downsampled to ≤ 300 points."""
+        hours = float(req.rel_url.query.get("hours", 24))
+        cutoff = time.time() - hours * 3600
+        samples = [p for p in self.ctrl.power_history if p["ts"] >= cutoff]
+        step = max(1, len(samples) // 300)
+        return web.json_response(samples[::step])
 
     async def _config_get(self, req): return web.json_response(self.ctrl.cfg)
 
@@ -1173,10 +1207,14 @@ function DashboardTab({status, cfg}) {
         note: status.prio ? 'Priority: '+status.prio : ''
       })),
       h(Card, {title:'Estimated power'}, h(Stat, {
-        label:'Electrical draw',
+        label:'Now / last 24h',
         value: status.est_power_kw!=null ? status.est_power_kw.toFixed(2)+' kW' : '—',
         valueColor: status.est_power_kw>0 ? '#f6a23a' : '#7b87a8',
-        note: status.int_add_kw>0 ? 'Immersion heater: '+status.int_add_kw.toFixed(1)+' kW' : 'Compressor + pumps model'
+        note: [
+          status.power_24h_kwh!=null ? status.power_24h_kwh.toFixed(1)+' kWh / 24h' : null,
+          status.comp_runtime_24h_h!=null ? 'compressor '+status.comp_runtime_24h_h.toFixed(1)+' h' : null,
+          status.int_add_kw>0 ? 'heater '+status.int_add_kw.toFixed(1)+' kW' : null
+        ].filter(Boolean).join(' · ') || 'Compressor + pumps model'
       }))
     )
   );
@@ -1196,7 +1234,9 @@ function HistoryTab() {
 // ── Charts tab ────────────────────────────────────────────────────────────────
 function ChartsTab() {
   const [history, setHistory] = useState(null);
+  const [power, setPower]     = useState(null);
   useEffect(() => { GET('api/history?n=200').then(setHistory).catch(()=>setHistory([])); }, []);
+  useEffect(() => { GET('api/power?hours=24').then(setPower).catch(()=>setPower([])); }, []);
   if (history === null) return h('div', {style:{color:'#7b87a8',padding:20}}, 'Loading…');
   if (!history.length) return h('div', {style:{color:'#7b87a8',padding:20,fontSize:13}}, 'No data yet.');
   const labels = history.map(e => fmtTs(e.ts));
@@ -1226,6 +1266,14 @@ function ChartsTab() {
       h(BarChart, {id:'price', labels, height:160,
         data:   history.map(e=>e.price_value),
         colors: history.map(e=>lvColor(e.price_level)),
+      })
+    ),
+    power && power.length > 0 && h(Card, {title:'Heat pump power (last 24h, estimated)'},
+      h(LineChart, {id:'power', labels: power.map(p=>fmtTs(p.ts)), height:180,
+        datasets:[
+          {label:'Total kW', data:power.map(p=>p.kw), borderColor:'#f6a23a', backgroundColor:'#f6a23a22', fill:true, tension:.1, pointRadius:0, stepped:true},
+          {label:'Immersion kW', data:power.map(p=>p.add), borderColor:'#e05c2a', borderDash:[4,3], fill:false, tension:.1, pointRadius:0, stepped:true},
+        ]
       })
     )
   );
