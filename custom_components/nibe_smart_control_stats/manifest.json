@@ -1,0 +1,12 @@
+{
+  "domain": "nibe_smart_control_stats",
+  "name": "Nibe Smart Control Statistics",
+  "codeowners": ["@gustjoha"],
+  "config_flow": true,
+  "documentation": "https://github.com/gustjoha/nibe-heatpump-homeassistant",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/gustjoha/nibe-heatpump-homeassistant/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

@@ -1,0 +1,47 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Nibe Smart Control",
+        "description": "{hint}",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the addon at that host/port. Check it's running and reachable from Home Assistant core.",
+      "invalid_response": "Connected, but the response didn't look like the Nibe Smart Control API. Check the port.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This addon instance is already configured."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "combined_offset": { "name": "Curve offset (combined)" },
+      "weather_offset": { "name": "Weather offset" },
+      "indoor_offset": { "name": "Indoor offset" },
+      "price_offset": { "name": "Price offset" },
+      "indoor_temp": { "name": "Indoor temperature" },
+      "outdoor_temp": { "name": "Outdoor temperature" },
+      "electricity_price": { "name": "Electricity price" },
+      "price_level": { "name": "Price level" },
+      "estimated_power": { "name": "Estimated power" },
+      "lifetime_energy": { "name": "Estimated lifetime energy" },
+      "compressor_runtime_24h": { "name": "Compressor runtime (24h)" }
+    }
+  },
+  "services": {
+    "backfill_history": {
+      "name": "Backfill history",
+      "description": "One-time import of the addon's already-accumulated history into Home Assistant's long-term statistics.",
+      "fields": {
+        "entry_id": { "name": "Config entry", "description": "The Nibe Smart Control Statistics config entry to backfill." },
+        "days": { "name": "Days", "description": "How many days of history to import." }
+      }
+    }
+  }
+}

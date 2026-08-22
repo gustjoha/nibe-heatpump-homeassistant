@@ -1,0 +1,26 @@
+backfill_history:
+  name: Backfill history
+  description: >
+    One-time import of the addon's already-accumulated history (offsets,
+    temperatures, price, estimated power/energy) into Home Assistant's
+    long-term statistics, using the recorder's external statistics API.
+    Run this once after setting up the integration. Running it again over
+    an overlapping window will double-count the estimated energy total.
+  fields:
+    entry_id:
+      name: Config entry
+      description: The Nibe Smart Control Statistics config entry to backfill.
+      required: true
+      selector:
+        config_entry:
+          integration: nibe_smart_control_stats
+    days:
+      name: Days
+      description: How many days of history to import (addon retains roughly 48h of 1-minute power samples plus up to 500 control-loop entries — going further back than the addon has kept will just import less).
+      required: false
+      default: 14
+      selector:
+        number:
+          min: 1
+          max: 90
+          unit_of_measurement: days

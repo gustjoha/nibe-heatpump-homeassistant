@@ -19,8 +19,10 @@ CONFIG_FILE  = DATA_DIR / "config.json"
 STATE_FILE   = DATA_DIR / "state.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 POWER_FILE   = DATA_DIR / "power_history.json"
+PRICE_ROLLING_FILE = DATA_DIR / "price_rolling.json"
 MAX_HISTORY  = 500
 MAX_POWER_SAMPLES = 2880  # 48h of 1-minute samples
+MIN_ROLLING_SAMPLES_FOR_DYNAMIC = 48  # ~half a day of 15-min entries before trusting percentiles
 MIN_WRITE_INTERVAL = 10
 
 LOG_LEVEL_MAP = {"debug": logging.DEBUG, "info": logging.INFO,
@@ -50,6 +52,7 @@ DEFAULT_CONFIG = {
     "prio_entity": "", "compressor_status_entity": "",
     "int_add_power_entity": "",
     "compressor_rated_kw": 1.7, "pump_overhead_kw": 0.12,
+    "price_rolling_window_days": 21.0,
     "log_level": "info",
 }
 
@@ -255,6 +258,8 @@ class NibeController:
         self.history: List[dict] = load_json(HISTORY_FILE, [])
         self.power_history: List[dict] = load_json(POWER_FILE, [])
         self._power_save_counter = 0
+        self.price_rolling: List[dict] = load_json(PRICE_ROLLING_FILE, [])
+        self._price_save_counter = 0
         self.ha: Optional[HAClient] = None
         self._live: dict = {}
         self._plan: List[dict] = []  # 24h hourly plan slots
@@ -336,13 +341,16 @@ class NibeController:
                         fc_by_hour[h] = fc
                 except Exception: continue
 
-        # ── Fetch Nordpool price series using raw timestamps ───────────────
+        # ── Fetch Nordpool price series — same rolling store the reactive
+        # loop uses, so planning and real-time control agree on what counts
+        # as cheap/expensive. This call also merges any new today/tomorrow
+        # points into the persistent rolling window.
         price_by_hour: dict = {}
-        all_prices_raw: list = []  # flat list for percentile calc
         price_entity = cfg.get("electricity_price_entity", "")
+        all_prices_raw = await self._fetch_and_merge_price_series() if price_entity else []
         if price_entity:
-            url = f"{self.ha.base}/states/{price_entity}"
             try:
+                url = f"{self.ha.base}/states/{price_entity}"
                 async with self.ha.session.get(url, headers=self.ha.headers,
                         timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status == 200:
@@ -357,13 +365,12 @@ class NibeController:
                                 if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
                                 h_offset = int((dt - now).total_seconds() / 3600)
                                 val = float(entry["value"])
-                                all_prices_raw.append(val)
                                 if 0 <= h_offset < lookahead:
                                     buckets.setdefault(h_offset, []).append(val)
                             except Exception: continue
                         price_by_hour = {h: sum(v)/len(v) for h, v in buckets.items() if v}
             except Exception as e:
-                self.logger.debug(f"planning price fetch: {e}")
+                self.logger.debug(f"planning price bucket fetch: {e}")
 
         # ── Fetch current battery SoC ──────────────────────────────────────
         battery_soc: float = None
@@ -583,6 +590,15 @@ class NibeController:
             self._live["compressor_on"] = comp_on
         if comp_on is not None or add_kw is not None:
             self._live["est_power_kw"] = round(total, 2)
+            # ── Lifetime energy counter (monotonic, never resets). This is
+            # what HA's Energy Dashboard needs — it requires a strictly
+            # increasing total, not a rolling window. Persisted in state.json
+            # so it survives addon restarts; a real utility-meter-style value
+            # rather than the 24h rolling figure below.
+            lifetime = float(self.state.get("lifetime_energy_kwh") or 0.0)
+            lifetime += total / 60.0
+            self.state["lifetime_energy_kwh"] = round(lifetime, 4)
+            self._live["lifetime_energy_kwh"] = round(lifetime, 4)
             # ── Record 1-minute sample and integrate last 24h to kWh.
             # Samples are 60s apart, so kWh ≈ Σ(kW) / 60 over the window.
             now_ts = int(time.time())
@@ -604,6 +620,7 @@ class NibeController:
             if self._power_save_counter >= 5:
                 self._power_save_counter = 0
                 save_json(POWER_FILE, self.power_history)
+                save_json(STATE_FILE, self.state)
         if add_kw is not None:
             self._live["int_add_kw"] = round(add_kw, 2)
         prio_ent = cfg.get("prio_entity", "")
@@ -647,16 +664,85 @@ class NibeController:
         self._live.update({"indoor_temp": actual, "indoor_setpoint": setpoint})
         self.logger.info(f"Indoor: {actual}→{setpoint} f={factor} → {offset:+.2f}")
 
+    async def _fetch_and_merge_price_series(self) -> list:
+        """Fetch raw_today/raw_tomorrow from the Nordpool entity, merge new
+        points into the persistent rolling store (dedup by timestamp), trim
+        to the configured window, and return the trimmed series of raw prices
+        for percentile classification. This is the single source of price
+        history for BOTH the reactive loop and the planning loop — previously
+        only planning fetched this, so the 5-min control loop always used the
+        (stale, hand-set) fixed EUR thresholds instead of adapting to the
+        market. Merging into a rolling multi-week window (not just the live
+        48h today/tomorrow snapshot) also means percentile bands stay stable
+        overnight before tomorrow's prices are published, and survive addon
+        restarts.
+        """
+        cfg = self.cfg
+        price_entity = cfg.get("electricity_price_entity", "")
+        if not price_entity: return [p["price"] for p in self.price_rolling]
+        try:
+            url = f"{self.ha.base}/states/{price_entity}"
+            async with self.ha.session.get(url, headers=self.ha.headers,
+                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    attrs = data.get("attributes", {})
+                    raw_entries = attrs.get("raw_today", []) + attrs.get("raw_tomorrow", [])
+                    existing_ts = {p["ts"] for p in self.price_rolling}
+                    added = 0
+                    for entry in raw_entries:
+                        if not entry or entry.get("value") is None: continue
+                        try:
+                            dt = datetime.fromisoformat(entry["start"])
+                            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                            ts = int(dt.timestamp())
+                            if ts in existing_ts: continue
+                            self.price_rolling.append({"ts": ts, "price": float(entry["value"])})
+                            existing_ts.add(ts)
+                            added += 1
+                        except Exception: continue
+                    if added:
+                        window_days = float(cfg.get("price_rolling_window_days", 21.0))
+                        cutoff = time.time() - window_days * 86400
+                        self.price_rolling = sorted(
+                            [p for p in self.price_rolling if p["ts"] >= cutoff],
+                            key=lambda p: p["ts"])
+                        self._price_save_counter += 1
+                        if self._price_save_counter >= 3:
+                            self._price_save_counter = 0
+                            save_json(PRICE_ROLLING_FILE, self.price_rolling)
+        except Exception as e:
+            self.logger.debug(f"price series fetch: {e}")
+        return [p["price"] for p in self.price_rolling]
+
+    def _price_percentile_thresholds(self) -> Optional[dict]:
+        """Live percentile cut points from the rolling store, for display."""
+        series = [p["price"] for p in self.price_rolling]
+        if len(series) < MIN_ROLLING_SAMPLES_FOR_DYNAMIC: return None
+        s = sorted(series); n = len(s)
+        def pct(p): return round(s[min(int(p * n / 100), n - 1)], 4)
+        return {"p15": pct(15), "p40": pct(40), "p75": pct(75), "p92": pct(92),
+                "samples": n,
+                "span_days": round((self.price_rolling[-1]["ts"] - self.price_rolling[0]["ts"]) / 86400, 1)
+                if self.price_rolling else 0}
+
     async def _run_price(self):
         cfg = self.cfg
         if not cfg.get("price_enabled"): self.state["price_offset"] = 0.0; return
         price = await self.ha.get_float(cfg.get("electricity_price_entity", ""))
         if price is None: return
-        level  = classify_price(price, cfg)
+        series = await self._fetch_and_merge_price_series()
+        dynamic = len(series) >= MIN_ROLLING_SAMPLES_FOR_DYNAMIC
+        level  = classify_price(price, cfg, series if dynamic else None)
         offset = price_to_offset(level, cfg)
         self.state.update({"price_offset": offset, "last_price_level": level, "last_price": price})
-        self._live.update({"price": price, "price_level": level})
-        self.logger.info(f"Price: {price:.4f} → {level} → {offset:+.1f}")
+        self._live.update({"price": price, "price_level": level,
+                            "price_mode": "dynamic" if dynamic else "fixed_fallback"})
+        thresholds = self._price_percentile_thresholds()
+        if thresholds: self._live["price_thresholds"] = thresholds
+        self.logger.info(
+            f"Price: {price:.4f} → {level} → {offset:+.1f} "
+            f"({'dynamic p'+str(thresholds['samples'])+'smp/'+str(thresholds['span_days'])+'d' if dynamic and thresholds else 'fixed fallback — building history'})")
 
     async def _apply(self):
         cfg      = self.cfg
@@ -807,6 +893,7 @@ class WebApp:
         app.router.add_get("/api/entities", self._entities)
         app.router.add_get("/api/plan",     self._plan_api)
         app.router.add_get("/api/power",    self._power_api)
+        app.router.add_get("/api/hastats",  self._hastats_api)
         return app
 
     async def _index(self, req: web.Request) -> web.Response:
@@ -828,6 +915,33 @@ class WebApp:
         step = max(1, len(samples) // 300)
         return web.json_response(samples[::step])
 
+    async def _hastats_api(self, req):
+        """Stable, versioned contract for the nibe_smart_control_stats HA
+        custom component. Internal field names in get_status()/self._live are
+        free to change; this endpoint is the one place that must stay
+        backward compatible so the integration doesn't break on addon updates."""
+        s = self.ctrl.get_status()
+        return web.json_response({
+            "schema": 1, "ts": int(time.time()),
+            "combined_offset_c":  s.get("combined_offset"),
+            "weather_offset_c":   s.get("weather_offset"),
+            "indoor_offset_c":    s.get("indoor_offset"),
+            "price_offset_c":     s.get("price_offset"),
+            "indoor_temp_c":      s.get("last_indoor_temp"),
+            "indoor_setpoint_c":  s.get("last_indoor_setpoint"),
+            "outdoor_temp_c":     s.get("last_outdoor_temp"),
+            "forecast_temp_c":    s.get("last_forecast_temp"),
+            "price_eur_kwh":      s.get("last_price"),
+            "price_level":        s.get("price_level"),
+            "price_mode":         s.get("price_mode"),
+            "est_power_kw":       s.get("est_power_kw"),
+            "power_24h_kwh":      s.get("power_24h_kwh"),
+            "lifetime_energy_kwh": s.get("lifetime_energy_kwh"),
+            "comp_runtime_24h_h": s.get("comp_runtime_24h_h"),
+            "compressor_on":      s.get("compressor_on"),
+            "dry_run":            s.get("dry_run"),
+        })
+
     async def _config_get(self, req): return web.json_response(self.ctrl.cfg)
 
     async def _config_post(self, req):
@@ -841,7 +955,7 @@ class WebApp:
                       "planning_lookahead_hours","price_preheat_hours",
                       "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min",
                       "indoor_gate_dead_band","max_step_per_write",
-                      "compressor_rated_kw","pump_overhead_kw"]:
+                      "compressor_rated_kw","pump_overhead_kw","price_rolling_window_days"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
                       "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled"]:
@@ -1190,7 +1304,13 @@ function DashboardTab({status, cfg}) {
     h(Grid, {cols:3},
       h(Card, {title:'Combined offset'},   h(Stat, {label:'Written to heat pump', value:fmtOff(status.combined_offset), valueColor:offColor(status.combined_offset), note:'Last: '+fmtTs(status.last_write_ts)})),
       h(Card, {title:'Outdoor'},           h(Stat, {label:'Current', value:fmtTemp(status.last_outdoor_temp), note:status.last_forecast_temp!=null?'Forecast → '+fmtTemp(status.last_forecast_temp):''})),
-      h(Card, {title:'Electricity'},       h(Stat, {label:'Current price', value:status.last_price!=null?status.last_price.toFixed(4):'—', note:h(PriceBadge, {level:status.price_level})}))
+      h(Card, {title:'Electricity'},       h(Stat, {label:'Current price', value:status.last_price!=null?status.last_price.toFixed(4):'—', note:h('div', null,
+        h(PriceBadge, {level:status.price_level}),
+        status.price_thresholds && h('div', {style:{fontSize:11,color:'#7b87a8',marginTop:4}},
+          `Adaptive · ${status.price_thresholds.samples} pts / ${status.price_thresholds.span_days}d · bands ${status.price_thresholds.p15}–${status.price_thresholds.p40}–${status.price_thresholds.p75}–${status.price_thresholds.p92}`),
+        status.price_mode==='fixed_fallback' && h('div', {style:{fontSize:11,color:'#f6a23a',marginTop:4}},
+          'Building price history — using fixed fallback thresholds')
+      )}))
     ),
     h(Card, {title:'Offset decomposition'},
       h(DecompBar, {weather:status.weather_offset||0, indoor:status.indoor_offset||0, price:status.price_offset||0})
@@ -1212,6 +1332,7 @@ function DashboardTab({status, cfg}) {
         valueColor: status.est_power_kw>0 ? '#f6a23a' : '#7b87a8',
         note: [
           status.power_24h_kwh!=null ? status.power_24h_kwh.toFixed(1)+' kWh / 24h' : null,
+          status.lifetime_energy_kwh!=null ? 'lifetime '+status.lifetime_energy_kwh.toFixed(0)+' kWh' : null,
           status.comp_runtime_24h_h!=null ? 'compressor '+status.comp_runtime_24h_h.toFixed(1)+' h' : null,
           status.int_add_kw>0 ? 'heater '+status.int_add_kw.toFixed(1)+' kW' : null
         ].filter(Boolean).join(' · ') || 'Compressor + pumps model'
@@ -1372,7 +1493,11 @@ function SettingsTab() {
         h(NumField, {label:'Expensive',  value:cfg.price_expensive,  min:-5, max:5, step:0.5, onChange:v=>set('price_expensive',v)}),
         h(NumField, {label:'Very Expensive', value:cfg.price_very_expensive, min:-5, max:5, step:0.5, onChange:v=>set('price_very_expensive',v)}),
       ),
-      h('div', {style:{fontSize:11,color:'#7b87a8',textTransform:'uppercase',letterSpacing:'.06em',margin:'4px 0 8px'}}, 'Price thresholds (EUR/kWh)'),
+      h('div', {style:{fontSize:11,color:'#7b87a8',textTransform:'uppercase',letterSpacing:'.06em',margin:'4px 0 8px'}}, 'Adaptive classification'),
+      h('div', {style:{background:'rgba(58,130,247,.06)',border:'1px solid rgba(58,130,247,.2)',borderRadius:8,padding:'12px 14px',marginBottom:14,fontSize:12,color:'#7b87a8',lineHeight:1.6}},
+        'Cheap/expensive is judged against a rolling percentile window built from real Nord Pool history, not a fixed EUR/kWh number — the market moves too much for a fixed number to stay right (e.g. it can nearly halve within months). The window needs about half a day of data before it takes over; until then the fixed fallback below is used, shown live on the Dashboard.'),
+      h(NumField, {label:'Rolling window (days)', value:cfg.price_rolling_window_days, min:3, max:60, step:1, hint:'Longer = smoother but slower to react to structural price shifts. 14–30 days recommended.', onChange:v=>set('price_rolling_window_days',v)}),
+      h('div', {style:{fontSize:11,color:'#7b87a8',textTransform:'uppercase',letterSpacing:'.06em',margin:'14px 0 8px'}}, 'Fixed fallback thresholds (EUR/kWh) — cold start only'),
       h('div', {style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10}},
         h(NumField, {label:'Very Cheap ≤', value:cfg.price_very_cheap_threshold, min:0, step:0.01, onChange:v=>set('price_very_cheap_threshold',v)}),
         h(NumField, {label:'Cheap ≤',      value:cfg.price_cheap_threshold,      min:0, step:0.01, onChange:v=>set('price_cheap_threshold',v)}),
