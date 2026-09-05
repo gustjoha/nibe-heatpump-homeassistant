@@ -44,6 +44,19 @@ All three offsets are summed and written to the NibeGW curve offset entity, with
 | `number.nibe_heat_curve_s1` | 47007 | Heat curve steepness (read) |
 | `number.nibe_heat_offset_s1` | 47011 | **Curve offset (addon writes here)** |
 
+### Recommended NIBE settings when using this addon
+
+The F1245 has its own internal room-compensation loop (**menu 1.9.4, "Room sensor settings"**), which nudges the calculated supply temperature based on the difference between a target room temperature and its own room sensor (BT50), scaled by a "factor system" gain. The installer manual itself warns that too high a factor system value can produce an unstable room temperature — which is exactly the risk of running that internal loop *and* this addon's indoor P-controller at the same time, especially if they're reading different physical sensors. **Set the room sensor factor system to 0 (or disable room sensor influence on the curve) so this addon is the sole source of indoor-driven correction.**
+
+Once that's disabled, tune the indoor P-factor to your emitter type — the manual states the room-temperature-per-curve-step relationship differs a lot by system:
+
+| Emitter | Curve steps per 1°C of room temperature | Suggested P-factor |
+|---|---|---|
+| Underfloor heating | ~1 | 1 |
+| Radiators | ~2–3 | 2–3 |
+
+Underfloor systems also have much larger thermal mass than radiators — a slab can take hours to visibly respond to a curve change. With the pump's own compensation disabled, this addon is the only thing correcting for indoor temperature, so reacting to every 5-minute sample before the slab has caught up from the *previous* correction causes the same kind of hunting the manual warns about. The **"Min. minutes between indoor reactions"** setting (default 45 min) holds the committed indoor offset steady between real changes for this reason — the indoor overshoot gate still reacts immediately regardless, so safety isn't delayed by the hold.
+
 ### Configuration
 
 All settings are available in the addon's web UI on port 8099 — no need to edit YAML manually. Entity IDs autocomplete from your live HA instance.

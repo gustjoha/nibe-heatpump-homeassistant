@@ -37,6 +37,7 @@ DEFAULT_CONFIG = {
     "weather_enabled": False, "weather_enable_up": True, "weather_enable_down": True,
     "weather_adjust_factor": 0.0,
     "indoor_enabled": False, "indoor_target_temp": 21.0, "indoor_factor": 10.0,
+    "indoor_min_reaction_interval_min": 45.0,
     "price_enabled": False,
     "price_very_cheap": 2.0, "price_cheap": 1.0, "price_normal": 0.0,
     "price_expensive": -1.0, "price_very_expensive": -2.0,
@@ -659,10 +660,42 @@ class NibeController:
         if actual is None or setpoint is None: return
         if actual < 4: self.logger.warning(f"Indoor {actual}°C looks like fault"); return
         factor = float(cfg.get("indoor_factor", 10.0))
-        offset = calc_indoor_offset(setpoint, actual, factor)
-        self.state.update({"indoor_offset": offset, "last_indoor_temp": actual, "last_indoor_setpoint": setpoint})
+        computed = calc_indoor_offset(setpoint, actual, factor)
         self._live.update({"indoor_temp": actual, "indoor_setpoint": setpoint})
-        self.logger.info(f"Indoor: {actual}→{setpoint} f={factor} → {offset:+.2f}")
+        self.state.update({"last_indoor_temp": actual, "last_indoor_setpoint": setpoint})
+
+        # ── Thermal-lag hold. Underfloor heating (and, more mildly,
+        # radiators) take far longer to visibly move room temperature than
+        # our 5-minute sampling interval — a slab can take hours to respond
+        # to a curve change. Committing a fresh P-correction every cycle,
+        # before the previous one has had time to show up as an actual
+        # indoor temperature change, is exactly the hunting/instability
+        # failure mode NIBE's own manual warns about for its internal
+        # "room sensor factor system" (menu 1.9.4) — a risk that now sits
+        # entirely with this controller if that internal loop is disabled
+        # (recommended; see README). We hold the committed offset steady
+        # for `indoor_min_reaction_interval_min` between real changes. This
+        # only throttles how often the *proportional* correction updates —
+        # the indoor gate in _apply still reacts immediately to overshoot
+        # using whatever offset is currently held, so safety isn't delayed.
+        hold_min = float(cfg.get("indoor_min_reaction_interval_min", 45.0))
+        last_change_ts = self.state.get("last_indoor_offset_change_ts", 0)
+        elapsed_min = (time.time() - last_change_ts) / 60.0
+        held = self.state.get("indoor_offset", 0.0)
+
+        if abs(computed - held) < 0.1:
+            self.logger.debug(f"Indoor: {actual}→{setpoint} f={factor} → {held:+.2f} (unchanged)")
+            return
+
+        if last_change_ts == 0 or elapsed_min >= hold_min:
+            self.state["indoor_offset"] = computed
+            self.state["last_indoor_offset_change_ts"] = time.time()
+            self.logger.info(f"Indoor: {actual}→{setpoint} f={factor} → {computed:+.2f} (committed)")
+        else:
+            remaining = hold_min - elapsed_min
+            self.logger.info(
+                f"Indoor: {actual}→{setpoint} f={factor} → computed {computed:+.2f}, "
+                f"holding at {held:+.2f} (thermal-lag hold, {remaining:.0f} min left)")
 
     async def _fetch_and_merge_price_series(self) -> list:
         """Fetch raw_today/raw_tomorrow from the Nordpool entity, merge new
@@ -949,6 +982,7 @@ class WebApp:
             body = await req.json()
             for k in ["forecast_hours","weather_adjust_factor","indoor_target_temp",
                       "indoor_factor","price_very_cheap","price_cheap","price_normal",
+                      "indoor_min_reaction_interval_min",
                       "price_expensive","price_very_expensive","price_very_cheap_threshold",
                       "price_cheap_threshold","price_expensive_threshold",
                       "price_very_expensive_threshold","min_write_interval_min",
@@ -1473,7 +1507,9 @@ function SettingsTab() {
         h('div', {style:{width:14}}),
         h(NumField, {label:'Target indoor temp (°C)', value:cfg.indoor_target_temp, min:10, max:28, step:0.5, hint:'Used when no setpoint entity', onChange:v=>set('indoor_target_temp',v)}),
         h('div', {style:{width:14}}),
-        h(NumField, {label:'P-factor', value:cfg.indoor_factor, min:1, max:50, step:1, hint:'offset = (setpoint − actual) × factor. Default 10', onChange:v=>set('indoor_factor',v)}),
+        h(NumField, {label:'P-factor', value:cfg.indoor_factor, min:1, max:50, step:1, hint:'offset = (setpoint − actual) × factor. Manual: ~1 for underfloor heating, ~2–3 for radiators (steps needed per °C of room change)', onChange:v=>set('indoor_factor',v)}),
+        h('div', {style:{width:14}}),
+        h(NumField, {label:'Min. minutes between indoor reactions', value:cfg.indoor_min_reaction_interval_min, min:5, max:180, step:5, hint:'Underfloor slabs take hours to respond — reacting every cycle before that shows up causes hunting. 45–90 for UFH, 15–30 for radiators.', onChange:v=>set('indoor_min_reaction_interval_min',v)}),
       ),
       h(Toggle, {label:'Enable indoor temperature control', checked:!!cfg.indoor_enabled, onChange:v=>set('indoor_enabled',v)}),
       cfg.indoor_enabled && h('div', {style:{maxWidth:300,marginTop:10}},
