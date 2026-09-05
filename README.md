@@ -89,6 +89,15 @@ On first install (or after a long addon downtime) there isn't enough history yet
 
 These fallback numbers are a safety net, not something you need to tune to the current market — the adaptive window takes over automatically.
 
+### Solar forecasting
+
+The planner can weight cheap/expensive decisions by expected solar production. Two modes:
+
+- **Manual entity** — point at any live solar sensor (W or kWh); the addon applies that single reading flatly across every hour of the plan. Simple, but blind to time-of-day.
+- **[Helios Forecast](https://github.com/ReikanYsora/Helios-Forecast)** — a genuine self-learning solar production forecast. Helios exposes point values (`power_now`, `power_next_hour`) and daily totals over a 7-day horizon as plain sensors, but not a full hourly curve via simple entities — so the addon shapes those daily totals (today's remaining production, tomorrow's total) into an hourly curve itself, using a bell curve centred on a configurable daylight window (adjust seasonally — Lithuanian winter daylight is much shorter than summer). This means solar correctly reads near-zero at night and peaks around midday rather than repeating one flat number for all 24 hours.
+
+Enable under **Settings → Solar & Battery → Use Helios Forecast**, then point the three entity fields at your Helios device's sensors (defaults match Helios's standard naming). If you have multiple panel lines (different roof orientations), each gets its own Helios device — sum them into a template sensor first, or point the addon at your primary line.
+
 ---
 
 ## Home Assistant statistics integration (optional)

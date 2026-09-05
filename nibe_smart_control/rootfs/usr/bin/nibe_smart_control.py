@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Nibe Smart Control — Home Assistant Addon v1.3.0
+Nibe Smart Control — Home Assistant Addon v1.4.2
 React 18 UMD frontend, served via HA Ingress.
 All config stored in /data/config.json (edited via web UI).
 """
 
-import asyncio, json, logging, os, sys, time
+import asyncio, csv, io, json, logging, math, os, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Any
@@ -48,6 +48,11 @@ DEFAULT_CONFIG = {
     "price_preheat_hours": 2,
     "solar_enabled": False, "solar_entity": "", "solar_peak_kwh": 10.0,
     "solar_weight": 0.4, "battery_entity": "", "battery_weight": 0.3,
+    "solar_use_helios": False,
+    "helios_power_now_entity": "sensor.helios_forecast_power_now",
+    "helios_energy_today_remaining_entity": "sensor.helios_forecast_energy_today_remaining",
+    "helios_energy_day2_entity": "sensor.helios_forecast_energy_day_2",
+    "solar_window_start_hour": 7.0, "solar_window_end_hour": 19.0,
     "battery_useful_soc_min": 20.0, "indoor_gate_dead_band": 0.5,
     "max_step_per_write": 3.0,
     "prio_entity": "", "compressor_status_entity": "",
@@ -391,34 +396,97 @@ class NibeController:
         # ── Solar scoring per hour ─────────────────────────────────────────
         # Use UV index + cloud coverage from OWM forecast to estimate relative
         # solar output as a fraction of peak_kwh (0.0 – 1.0).
-        # Formula: solar_fraction = uv_index/11 * (1 - cloud_coverage/100) * 0.85
-        # This is intentionally approximate — weighted down vs price anyway.
         solar_enabled  = cfg.get("solar_enabled", False)
-        solar_entity   = cfg.get("solar_entity", "")
         peak_kwh       = float(cfg.get("solar_peak_kwh", 10.0))
         solar_weight   = float(cfg.get("solar_weight", 0.4))
         battery_weight = float(cfg.get("battery_weight", 0.3))
         batt_soc_min   = float(cfg.get("battery_useful_soc_min", 20.0))
+        use_helios     = cfg.get("solar_use_helios", False)
 
-        # Read current solar output from user-specified entity (W or kWh sensor)
         current_solar_frac = 0.0
-        if solar_enabled and solar_entity:
-            sol_val = await self.ha.get_float(solar_entity)
-            if sol_val is not None and peak_kwh > 0:
-                # Accept both W (e.g. 3500 W) and kWh (e.g. 3.5 kWh) sensors
-                # Heuristic: if value > 100, assume it's in W, else kWh
-                if sol_val > 100:
-                    sol_kwh = sol_val / 1000.0   # W → kWh equivalent
-                else:
-                    sol_kwh = sol_val
-                current_solar_frac = min(1.0, max(0.0, sol_kwh / peak_kwh))
-                self._live["solar_fraction"] = round(current_solar_frac, 2)
-                self._live["solar_kwh"] = round(sol_kwh, 2)
+        solar_kwh_by_hour: dict = {}  # hour_offset -> forecast kWh for that slot
 
-        # For per-slot planning: solar fraction is uniform (current reading).
-        # A user with a Solcast-type forecast sensor could extend this later.
-        def solar_fraction(fc_slot: dict) -> float:
-            return current_solar_frac
+        if solar_enabled and use_helios:
+            # ── Helios Forecast: real per-hour-shaped production instead of
+            # a single live reading repeated for every hour (the old
+            # behaviour, kept below for users without Helios). Helios only
+            # publishes point values (now / next hour) plus DAILY totals
+            # over its 7-day horizon as plain sensors — not a full hourly
+            # curve via simple entities — so we shape those daily totals
+            # into an hourly curve ourselves with a raised-cosine bell
+            # centred on a configured daylight window. This is an
+            # approximation (true sunrise/sunset drifts a few minutes a
+            # day; not chased here) but is a large step up from a flat
+            # number that doesn't know night from midday. Hour-of-day is
+            # computed in the container's LOCAL timezone — HA Supervisor
+            # normally propagates the host TZ to addons automatically.
+            win_start = float(cfg.get("solar_window_start_hour", 7.0))
+            win_end   = float(cfg.get("solar_window_end_hour", 19.0))
+
+            def _bell(hour_of_day: float) -> float:
+                if win_end <= win_start or hour_of_day <= win_start or hour_of_day >= win_end:
+                    return 0.0
+                x = (hour_of_day - win_start) / (win_end - win_start)
+                return max(0.0, math.sin(math.pi * x))
+
+            power_now  = await self.ha.get_float(cfg.get("helios_power_now_entity", ""))
+            today_left = await self.ha.get_float(cfg.get("helios_energy_today_remaining_entity", ""))
+            day2_total = await self.ha.get_float(cfg.get("helios_energy_day2_entity", ""))
+
+            if power_now is not None and peak_kwh > 0:
+                current_solar_frac = min(1.0, max(0.0, (power_now / 1000.0) / peak_kwh))
+                self._live["solar_fraction"] = round(current_solar_frac, 2)
+                self._live["solar_kwh"] = round(power_now / 1000.0, 2)
+
+            now_local = now.astimezone()
+            today_date = now_local.date()
+            tomorrow_date = today_date + timedelta(days=1)
+            day_totals = {today_date: today_left or 0.0, tomorrow_date: day2_total or 0.0}
+
+            day_weights: dict = {}  # date -> {hour_offset: weight}
+            for h in range(lookahead):
+                slot_local = (now + timedelta(hours=h)).astimezone()
+                hod = slot_local.hour + slot_local.minute / 60.0
+                day_weights.setdefault(slot_local.date(), {})[h] = _bell(hod)
+
+            for d, weights in day_weights.items():
+                # Beyond tomorrow we don't have a Helios total — reuse
+                # tomorrow's forecast as a rough continuation rather than
+                # silently zeroing out (documented limitation: only
+                # power_now/today_remaining/day_2 are wired up).
+                total_kwh = day_totals.get(d, day2_total or 0.0)
+                wsum = sum(weights.values())
+                if wsum <= 0 or total_kwh <= 0:
+                    for h in weights: solar_kwh_by_hour[h] = 0.0
+                    continue
+                for h, w in weights.items():
+                    solar_kwh_by_hour[h] = total_kwh * (w / wsum)
+
+            def solar_fraction(hour_offset: int) -> float:
+                if peak_kwh <= 0: return 0.0
+                return min(1.0, max(0.0, solar_kwh_by_hour.get(hour_offset, 0.0) / peak_kwh))
+
+        elif solar_enabled:
+            # ── Manual mode: a single live reading (W or kWh) applied
+            # flatly to every hour in the plan — simple, but blind to
+            # time-of-day (the same number is used for a 2pm slot and a
+            # 2am slot). Kept for anyone without a real forecast source.
+            solar_entity = cfg.get("solar_entity", "")
+            if solar_entity:
+                sol_val = await self.ha.get_float(solar_entity)
+                if sol_val is not None and peak_kwh > 0:
+                    # Accept both W (e.g. 3500 W) and kWh (e.g. 3.5 kWh) sensors.
+                    # Heuristic: if value > 100, assume it's in W, else kWh.
+                    sol_kwh = sol_val / 1000.0 if sol_val > 100 else sol_val
+                    current_solar_frac = min(1.0, max(0.0, sol_kwh / peak_kwh))
+                    self._live["solar_fraction"] = round(current_solar_frac, 2)
+                    self._live["solar_kwh"] = round(sol_kwh, 2)
+
+            def solar_fraction(hour_offset: int) -> float:
+                return current_solar_frac
+        else:
+            def solar_fraction(hour_offset: int) -> float:
+                return 0.0
 
         def battery_coverage(soc: float) -> float:
             """0.0–1.0 — how much useful battery reserve exists above minimum."""
@@ -450,8 +518,8 @@ class NibeController:
             # Solar bonus: good solar ahead → cheaper effective hour → shift offset up slightly
             solar_offset = 0.0
             solar_frac   = 0.0
-            if solar_enabled and fc_slot:
-                solar_frac = solar_fraction(fc_slot)
+            if solar_enabled:
+                solar_frac = solar_fraction(h)
                 est_kwh    = round(solar_frac * peak_kwh, 2)
                 # High solar output = we can afford to heat more during that hour
                 # Weight it as a fraction of the VERY_CHEAP offset
@@ -560,7 +628,23 @@ class NibeController:
             except Exception as e: self.logger.error(f"apply: {e}")
             try: await self._update_power_estimate()
             except Exception as e: self.logger.debug(f"power est: {e}")
+            try: await self._update_actual_offset()
+            except Exception as e: self.logger.debug(f"actual offset read: {e}")
             await asyncio.sleep(60)
+
+    async def _update_actual_offset(self):
+        """Read the real, current value of the curve offset register from HA.
+        Distinct from combined_offset (this addon's calculated/intended
+        value) — in dry run, or whenever the slew limiter is still catching
+        up to a target, these can legitimately differ from what's actually
+        sitting on the pump right now."""
+        offset_entity = self.cfg.get("curve_offset_entity", "")
+        if not offset_entity:
+            self._live.pop("actual_curve_offset", None)
+            return
+        val = await self.ha.get_float(offset_entity)
+        if val is not None:
+            self._live["actual_curve_offset"] = round(val, 1)
 
     async def _update_power_estimate(self):
         """Estimate heat pump electrical power from compressor status +
@@ -927,6 +1011,9 @@ class WebApp:
         app.router.add_get("/api/plan",     self._plan_api)
         app.router.add_get("/api/power",    self._power_api)
         app.router.add_get("/api/hastats",  self._hastats_api)
+        app.router.add_get("/api/export/history", self._export_history_csv)
+        app.router.add_get("/api/export/plan",    self._export_plan_csv)
+        app.router.add_get("/api/export/power",   self._export_power_csv)
         return app
 
     async def _index(self, req: web.Request) -> web.Response:
@@ -989,10 +1076,12 @@ class WebApp:
                       "planning_lookahead_hours","price_preheat_hours",
                       "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min",
                       "indoor_gate_dead_band","max_step_per_write",
-                      "compressor_rated_kw","pump_overhead_kw","price_rolling_window_days"]:
+                      "compressor_rated_kw","pump_overhead_kw","price_rolling_window_days",
+                      "solar_window_start_hour","solar_window_end_hour"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
-                      "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled"]:
+                      "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled",
+                      "solar_use_helios"]:
                 if k in body: body[k] = bool(body[k])
             self.ctrl.cfg.update(body)
             save_json(CONFIG_FILE, self.ctrl.cfg)
@@ -1006,6 +1095,58 @@ class WebApp:
 
     async def _plan_api(self, req):
         return web.json_response(self.ctrl._plan)
+
+    @staticmethod
+    def _csv_response(filename: str, fieldnames: list, rows: list) -> web.Response:
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            # Flatten lists (e.g. plan "actions") into a single readable cell
+            flat = {k: ("; ".join(v) if isinstance(v, list) else v) for k, v in row.items()}
+            writer.writerow(flat)
+        return web.Response(
+            text=buf.getvalue(),
+            content_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    async def _export_history_csv(self, req):
+        fields = ["ts", "combined", "weather", "indoor", "price", "price_level",
+                  "price_value", "outdoor_temp", "indoor_temp", "indoor_setpoint",
+                  "forecast_temp", "dry_run", "reasons"]
+        rows = []
+        for e in self.ctrl.history:
+            row = dict(e)
+            if row.get("ts"):
+                row["ts"] = datetime.fromtimestamp(row["ts"], tz=timezone.utc).isoformat()
+            rows.append(row)
+        return self._csv_response("nibe_history.csv", fields, rows)
+
+    async def _export_plan_csv(self, req):
+        fields = ["hour_offset", "ts", "temp", "price", "price_level",
+                  "weather_plan_offset", "price_plan_offset", "solar_offset",
+                  "battery_offset", "preheat_offset", "solar_fraction",
+                  "combined_plan_offset", "actions"]
+        rows = []
+        for e in self.ctrl._plan:
+            row = dict(e)
+            if row.get("ts"):
+                row["ts"] = datetime.fromtimestamp(row["ts"], tz=timezone.utc).isoformat()
+            rows.append(row)
+        return self._csv_response("nibe_plan.csv", fields, rows)
+
+    async def _export_power_csv(self, req):
+        hours = float(req.rel_url.query.get("hours", 48))
+        cutoff = time.time() - hours * 3600
+        fields = ["ts", "kw", "comp", "add"]
+        rows = []
+        for p in self.ctrl.power_history:
+            if p["ts"] < cutoff: continue
+            row = dict(p)
+            row["ts"] = datetime.fromtimestamp(row["ts"], tz=timezone.utc).isoformat()
+            rows.append(row)
+        return self._csv_response("nibe_power.csv", fields, rows)
 
     async def start(self, port=8099):
         runner = web.AppRunner(self.build())
@@ -1058,6 +1199,34 @@ const apiFetch = async (path, opts={}) => {
 };
 const GET  = p => apiFetch(p);
 const POST = (p,d) => apiFetch(p, {method:'POST', body:JSON.stringify(d)});
+
+const downloadCsv = async (path, filename, setBusy) => {
+  setBusy && setBusy(true);
+  try {
+    const url = _BASE + '/' + path.replace(/^\/+/, '');
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(objUrl);
+  } finally { setBusy && setBusy(false); }
+};
+
+function ExportButton({path, filename, label}) {
+  const [busy, setBusy] = useState(false);
+  return h('button', {
+    onClick: () => downloadCsv(path, filename, setBusy),
+    disabled: busy,
+    style: {
+      background:'transparent', border:'1px solid #3a4258', color:'#c9d1e0',
+      borderRadius:6, padding:'6px 12px', fontSize:12, cursor: busy?'default':'pointer',
+      opacity: busy?0.6:1,
+    }
+  }, busy ? 'Exporting…' : (label || 'Export CSV'));
+}
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 const ToastCtx = React.createContext(null);
@@ -1336,7 +1505,11 @@ function DashboardTab({status, cfg}) {
       )
     ),
     h(Grid, {cols:3},
-      h(Card, {title:'Combined offset'},   h(Stat, {label:'Written to heat pump', value:fmtOff(status.combined_offset), valueColor:offColor(status.combined_offset), note:'Last: '+fmtTs(status.last_write_ts)})),
+      h(Card, {title:'Combined offset'},   h(Stat, {label: status.dry_run ? 'Calculated (dry run)' : 'Written to heat pump', value:fmtOff(status.combined_offset), valueColor:offColor(status.combined_offset), note:h('div', null,
+        'Last: '+fmtTs(status.last_write_ts),
+        status.actual_curve_offset!=null && h('div', {style:{marginTop:4, color: status.dry_run && Math.abs((status.actual_curve_offset||0)-(status.combined_offset||0))>0.05 ? '#f6a23a' : '#7b87a8'}},
+          `Actual on pump: ${fmtOff(status.actual_curve_offset)}`)
+      )})),
       h(Card, {title:'Outdoor'},           h(Stat, {label:'Current', value:fmtTemp(status.last_outdoor_temp), note:status.last_forecast_temp!=null?'Forecast → '+fmtTemp(status.last_forecast_temp):''})),
       h(Card, {title:'Electricity'},       h(Stat, {label:'Current price', value:status.last_price!=null?status.last_price.toFixed(4):'—', note:h('div', null,
         h(PriceBadge, {level:status.price_level}),
@@ -1381,7 +1554,10 @@ function HistoryTab() {
   useEffect(() => { GET('api/history').then(setHistory).catch(()=>setHistory([])); }, []);
   if (history === null) return h('div', {style:{color:'#7b87a8',padding:20}}, 'Loading…');
   if (!history.length) return h('div', {style:{color:'#7b87a8',padding:20,fontSize:13}}, 'No changes recorded yet. The addon writes to the heat pump once the first sensor readings come in.');
-  return h(Card, {title:'Change log'},
+  return h(Card, {title: h('div', {style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+      h('span', null, 'Change log'),
+      h(ExportButton, {path:'api/export/history', filename:'nibe_history.csv'})
+    )},
     h('div', null, [...history].reverse().map((e,i) => h(HistoryRow, {key:i, entry:e})))
   );
 }
@@ -1423,7 +1599,10 @@ function ChartsTab() {
         colors: history.map(e=>lvColor(e.price_level)),
       })
     ),
-    power && power.length > 0 && h(Card, {title:'Heat pump power (last 24h, estimated)'},
+    power && power.length > 0 && h(Card, {title: h('div', {style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+        h('span', null, 'Heat pump power (last 24h, estimated)'),
+        h(ExportButton, {path:'api/export/power?hours=48', filename:'nibe_power.csv'})
+      )},
       h(LineChart, {id:'power', labels: power.map(p=>fmtTs(p.ts)), height:180,
         datasets:[
           {label:'Total kW', data:power.map(p=>p.kw), borderColor:'#f6a23a', backgroundColor:'#f6a23a22', fill:true, tension:.1, pointRadius:0, stepped:true},
@@ -1549,8 +1728,26 @@ function SettingsTab() {
           h('strong',{style:{color:'#f6d24a'}},'Solar and battery are weighted lower than the raw electricity price.')
         ),
         h(Toggle, {label:'Enable solar & battery planning', checked:!!cfg.solar_enabled, onChange:v=>set('solar_enabled',v)}),
+        cfg.solar_enabled && h('div', {style:{marginTop:12}},
+          h(Toggle, {label:'Use Helios Forecast (real per-hour shaped forecast)', checked:!!cfg.solar_use_helios, onChange:v=>set('solar_use_helios',v)}),
+        ),
+        cfg.solar_enabled && cfg.solar_use_helios && h('div', {style:{marginTop:10}},
+          h('div', {style:{fontSize:12,color:'#7b87a8',marginBottom:10,lineHeight:1.6}},
+            'Helios only publishes point values (now / next hour) and daily totals over its 7-day horizon as plain sensors — not a full hourly curve — so those daily totals are shaped into an hourly curve using a bell centred on the daylight window below. If you have multiple panel lines (roof orientations), each gets its own Helios device — sum them into a helper sensor first, or point at your primary line.'),
+          h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}},
+            h(EntityInput, {label:'Power now', name:'helios_power_now_entity', value:cfg.helios_power_now_entity||'', onChange:v=>set('helios_power_now_entity',v), domains:['sensor'], hint:'sensor.helios_forecast_power_now'}),
+            h(EntityInput, {label:'Energy remaining today', name:'helios_energy_today_remaining_entity', value:cfg.helios_energy_today_remaining_entity||'', onChange:v=>set('helios_energy_today_remaining_entity',v), domains:['sensor'], hint:'sensor.helios_forecast_energy_today_remaining'}),
+            h(EntityInput, {label:'Energy tomorrow (day 2)', name:'helios_energy_day2_entity', value:cfg.helios_energy_day2_entity||'', onChange:v=>set('helios_energy_day2_entity',v), domains:['sensor'], hint:'sensor.helios_forecast_energy_day_2'}),
+          ),
+          h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
+            h(NumField, {label:'Daylight window start (local hour)', value:cfg.solar_window_start_hour||7, min:0, max:12, step:0.5, hint:'Approximate — adjust seasonally (e.g. 8 in winter, 5 in summer)', onChange:v=>set('solar_window_start_hour',v)}),
+            h(NumField, {label:'Daylight window end (local hour)', value:cfg.solar_window_end_hour||19, min:12, max:24, step:0.5, hint:'Approximate — adjust seasonally (e.g. 16 in winter, 21 in summer)', onChange:v=>set('solar_window_end_hour',v)}),
+          ),
+        ),
+        cfg.solar_enabled && !cfg.solar_use_helios && h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
+          h(EntityInput, {label:'Solar output sensor', name:'solar_entity', value:cfg.solar_entity||'', onChange:v=>set('solar_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_measured_power (W) or sensor.solax_today_s_solar_energy (kWh). Applied flatly to every hour — switch on Helios Forecast above for a real per-hour shape.'}),
+        ),
         h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:10}},
-          h(EntityInput, {label:'Solar output sensor', name:'solar_entity', value:cfg.solar_entity||'', onChange:v=>set('solar_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_measured_power (W) or sensor.solax_today_s_solar_energy (kWh)'}),
           h(EntityInput, {label:'Battery SoC entity', name:'battery_entity', value:cfg.battery_entity||'', onChange:v=>set('battery_entity',v), domains:['sensor'], hint:'e.g. sensor.solax_battery_capacity'}),
           h(NumField, {label:'Solar peak output (kWh)', value:cfg.solar_peak_kwh||10, min:1, max:50, step:0.5, hint:'Your system peak on a perfect sunny day', onChange:v=>set('solar_peak_kwh',v)}),
           h(NumField, {label:'Solar weight (0–1)', value:cfg.solar_weight||0.4, min:0.1, max:1, step:0.1, hint:'How much solar shifts the effective price', onChange:v=>set('solar_weight',v)}),
@@ -1652,6 +1849,9 @@ function PlanningTab({status, cfg}) {
   const priceBar = p => p == null ? 0 : Math.round((p - pMin) / Math.max(0.001, pMax - pMin) * 80);
 
   return h('div', null,
+    h('div', {style:{display:'flex',justifyContent:'flex-end',marginBottom:10}},
+      h(ExportButton, {path:'api/export/plan', filename:'nibe_plan.csv', label:'Export plan CSV'})
+    ),
     // Summary cards
     h('div', {style:{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:14,marginBottom:14}},
       h(Card, {title:'Cheapest window (next 24h)'},
