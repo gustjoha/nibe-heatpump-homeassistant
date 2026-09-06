@@ -133,11 +133,15 @@ class HAClient:
                 return str(raw)
         except Exception: return None
 
-    async def set_number(self, entity_id: str, value: float) -> bool:
+    async def set_number(self, entity_id: str, value) -> bool:
         url = f"{self.base}/services/number/set_value"
         try:
+            # Sent as-is: the one caller (curve offset write) already
+            # quantizes to a whole integer before calling this, since the
+            # register only accepts whole steps. str() on an int here keeps
+            # it exactly "0" / "-2" rather than "0.0" / "-2.0".
             async with self.session.post(url, headers=self.headers,
-                    json={"entity_id": entity_id, "value": str(round(value, 1))},
+                    json={"entity_id": entity_id, "value": str(value)},
                     timeout=aiohttp.ClientTimeout(total=10)) as r:
                 return r.status in (200, 201)
         except Exception as e:
@@ -949,7 +953,22 @@ class NibeController:
                     f"price {p:+.2f}→{p_gated:+.2f})")
             w, p = w_gated, p_gated
 
-        combined = max(-10.0, min(10.0, round(w + ind + p, 1)))
+        # ── Quantize to whole integer steps. The physical register (47011)
+        # only accepts whole steps (-10..10) — the manual describes the
+        # offset purely in terms of "steps", never fractions of one. Every
+        # contribution above (weather/indoor/price) is computed as a
+        # continuous float for precision in the underlying math and for
+        # readable dashboard decomposition, but the value actually sent to
+        # the pump must be a whole number. Without this, the addon was
+        # asking HA's number.set_value service to write things like "0.4",
+        # which the register can't represent — depending on the integration,
+        # that either gets silently truncated (toward zero, so small
+        # corrections like 0.4 or -0.3 would round away to nothing even
+        # though the addon's own bookkeeping recorded them as "applied"),
+        # or rejected outright. Rounding here — to the nearest integer, not
+        # truncating — means our internal state always matches what's
+        # actually achievable on the register.
+        combined = int(round(max(-10.0, min(10.0, w + ind + p))))
         min_interval = float(cfg.get("min_write_interval_min", MIN_WRITE_INTERVAL)) * 60
         elapsed = time.time() - (s.get("last_write_ts") or 0)
         last    = s.get("last_combined_offset")
@@ -961,17 +980,24 @@ class NibeController:
         # of calculated supply, so a swing > 4 steps could hard-stop the
         # compressor mid-cycle. Default limit of 3 steps ≈ 7.5°C stays safely
         # under the trip wire while still reacting within 2-3 write cycles.
-        max_step = float(cfg.get("max_step_per_write", 3.0))
+        max_step = int(round(float(cfg.get("max_step_per_write", 3.0))))
         if last is not None and abs(combined - last) > max_step:
             slewed = last + max_step if combined > last else last - max_step
             self.logger.info(
-                f"Slew limit: target {combined:+.1f} clamped to {slewed:+.1f} "
-                f"(max {max_step:.1f} steps/write, protects against 5.1.3 trip)")
-            combined = round(slewed, 1)
+                f"Slew limit: target {combined:+d} clamped to {slewed:+d} "
+                f"(max {max_step} steps/write, protects against 5.1.3 trip)")
+            combined = int(slewed)
 
-        delta   = abs(combined - last) if last is not None else 999
-        if delta < 0.2: return
-        if delta < 0.5 and elapsed < min_interval: return
+        # Whole-step register: a "delta" is only ever 0, 1, 2, ... steps.
+        # No change at all → never write. A single-step nudge is still
+        # subject to the minimum write interval (protects the compressor
+        # from over-frequent small corrections); anything bigger goes
+        # through immediately regardless of elapsed time, on the assumption
+        # that a 2+ step swing reflects something worth reacting to promptly
+        # (e.g. a price spike) rather than noise.
+        delta = abs(combined - last) if last is not None else 999
+        if delta == 0: return
+        if delta == 1 and elapsed < min_interval: return
 
         # ── Hot water priority guard: curve offset only affects space heating;
         # during hot water production the pump runs fixed-condensing. Defer
@@ -987,9 +1013,9 @@ class NibeController:
         if not offset_entity and not dry_run: return
         reasons = self._build_reasons(w, ind, p, cfg, s)
         if dry_run:
-            self.logger.info(f"DRY RUN — would apply {combined:+.1f}°C (not written to pump)")
+            self.logger.info(f"DRY RUN — would apply {combined:+d} steps (not written to pump)")
         else:
-            self.logger.info(f"Apply {combined:+.1f}°C → {offset_entity}")
+            self.logger.info(f"Apply {combined:+d} steps → {offset_entity}")
         # In dry run: always log but never write. Outside dry run: log only on success.
         wrote = False
         if not dry_run:
@@ -1486,6 +1512,11 @@ function BarChart({id, data, labels, colors, height=160}) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const fmtOff = v => v == null ? '—' : (v > 0 ? '+' : '') + Number(v).toFixed(1) + '°C';
+// The register only stores whole integer steps — used for the combined/
+// actual offset (what's really written to the pump), never for the
+// individual weather/indoor/price contributions, which stay as continuous
+// °C-equivalent numbers purely to explain the reasoning behind that step.
+const fmtSteps = v => v == null ? '—' : (v > 0 ? '+' : '') + Math.round(Number(v)) + ' step' + (Math.round(Number(v)) === 1 || Math.round(Number(v)) === -1 ? '' : 's');
 const fmtTemp = v => v == null ? '—' : Number(v).toFixed(1) + '°C';
 const fmtTs = ts => ts ? new Date(ts*1000).toLocaleString('en-GB',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 const offColor = v => Number(v) > 0.05 ? '#f7953a' : Number(v) < -0.05 ? '#3a82f7' : '#7b87a8';
@@ -1531,7 +1562,7 @@ function HistoryRow({entry}) {
       fmtTs(entry.ts),
       isDry && h('span', {style:{display:'inline-block',marginLeft:5,padding:'1px 5px',borderRadius:3,fontSize:9,fontWeight:700,letterSpacing:'.05em',color:'#f6d24a',background:'rgba(246,210,74,.12)',border:'1px solid rgba(246,210,74,.3)'}}, 'DRY RUN')
     ),
-    h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:15,fontWeight:700,color:offColor(entry.combined)}}, fmtOff(entry.combined)),
+    h('div', {style:{fontFamily:'ui-monospace,monospace',fontSize:15,fontWeight:700,color:offColor(entry.combined)}}, fmtSteps(entry.combined)),
     h('div', {style:{fontSize:12,color:'#7b87a8',lineHeight:1.7}},
       (entry.reasons||[]).map((r,i) => {
         const tc = tagColor(r);
@@ -1563,10 +1594,10 @@ function DashboardTab({status, cfg}) {
       )
     ),
     h(Grid, {cols:3},
-      h(Card, {title:'Combined offset'},   h(Stat, {label: status.dry_run ? 'Calculated (dry run)' : 'Written to heat pump', value:fmtOff(status.combined_offset), valueColor:offColor(status.combined_offset), note:h('div', null,
+      h(Card, {title:'Combined offset'},   h(Stat, {label: status.dry_run ? 'Calculated (dry run)' : 'Written to heat pump', value:fmtSteps(status.combined_offset), valueColor:offColor(status.combined_offset), note:h('div', null,
         'Last: '+fmtTs(status.last_write_ts),
         status.actual_curve_offset!=null && h('div', {style:{marginTop:4, color: status.dry_run && Math.abs((status.actual_curve_offset||0)-(status.combined_offset||0))>0.05 ? '#f6a23a' : '#7b87a8'}},
-          `Actual on pump: ${fmtOff(status.actual_curve_offset)}`)
+          `Actual on pump: ${fmtSteps(status.actual_curve_offset)}`)
       )})),
       h(Card, {title:'Outdoor'},           h(Stat, {label:'Current', value:fmtTemp(status.last_outdoor_temp), note:status.last_forecast_temp!=null?'Forecast → '+fmtTemp(status.last_forecast_temp):''})),
       h(Card, {title:'Electricity'},       h(Stat, {label:'Current price', value:status.last_price!=null?status.last_price.toFixed(4):'—', note:h('div', null,
@@ -1858,7 +1889,7 @@ function SettingsTab() {
       h('div', {style:{maxWidth:260}}),
         h(NumField, {label:'Min minutes between writes', value:cfg.min_write_interval_min, min:5, max:120, step:5, hint:'Protects the heat pump compressor (5–120 min)', onChange:v=>set('min_write_interval_min',v)}),
         h('div', {style:{width:14}}),
-        h(NumField, {label:'Max offset steps per write', value:cfg.max_step_per_write, min:1, max:10, step:0.5, hint:'1 step ≈ 2.5°C supply. Keep ≤ 3 to stay under the pump\u2019s 5.1.3 compressor-stop trip (10°C)', onChange:v=>set('max_step_per_write',v)}),
+        h(NumField, {label:'Max offset steps per write', value:cfg.max_step_per_write, min:1, max:10, step:1, hint:'Whole steps only — the register can\u2019t take fractions. 1 step ≈ 2.5°C supply. Keep ≤ 3 to stay under the pump\u2019s 5.1.3 compressor-stop trip (10°C)', onChange:v=>set('max_step_per_write',v)}),
 
       h('div', {style:{marginTop:8,display:'flex',alignItems:'center',gap:12}},
         h('button', {
