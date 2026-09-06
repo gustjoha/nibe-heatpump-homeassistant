@@ -98,6 +98,17 @@ The planner can weight cheap/expensive decisions by expected solar production. T
 
 Enable under **Settings → Solar & Battery → Use Helios Forecast**, then point the three entity fields at your Helios device's sensors (defaults match Helios's standard naming). If you have multiple panel lines (different roof orientations), each gets its own Helios device — sum them into a template sensor first, or point the addon at your primary line.
 
+### Power estimation — no energy meter installed
+
+Without an AA3 energy meter board (BE6/BE7) or a CT clamp, the addon estimates electrical draw from compressor status + immersion heater register rather than measuring it directly. This estimate distinguishes a few things that materially affect accuracy:
+
+- **Space heating vs hot water draw are different constants.** Hot water targets a much higher condensing temperature (~46–50°C) than underfloor space heating (~35°C), and the manual's own EN14511 figures show COP dropping substantially between those two conditions — meaning real electrical draw is meaningfully higher during every HW cycle. The addon reads the Priority sensor (already used for the curve-offset write guard) to pick between "Compressor draw — space heating" and "Compressor draw — hot water" in Settings, rather than applying one flat number regardless of what the compressor is actually doing. The hot-water figure is a physically-reasoned estimate (COP-derived), not a manual value confirmed to two decimals — refine it against a real CT clamp reading once one is installed.
+- **Heating medium pump power scales with its real reported speed** (%), across the manual's documented 7–67W range, rather than a flat guess — and applies whether or not the compressor is currently running, since the pump can circulate independently in "auto" mode.
+- **A small standby draw is always included**, since the control board and display never fully power down even when the compressor, both pumps, and the immersion heater are all idle. This alone accounts for roughly 0.5 kWh/day that a "0 kW when idle" model would silently miss.
+- **Brine pump (GP2)** stays a flat, compressor-gated estimate (30–87W range from the manual) since there's no live speed telemetry for it.
+
+All of these are configurable under **Settings → Power & status monitoring**.
+
 ---
 
 ## Home Assistant statistics integration (optional)

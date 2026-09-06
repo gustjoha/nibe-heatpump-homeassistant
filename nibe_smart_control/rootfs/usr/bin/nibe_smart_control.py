@@ -54,10 +54,13 @@ DEFAULT_CONFIG = {
     "helios_energy_day2_entity": "sensor.helios_forecast_energy_day_2",
     "solar_window_start_hour": 7.0, "solar_window_end_hour": 19.0,
     "battery_useful_soc_min": 20.0, "indoor_gate_dead_band": 0.5,
+    "indoor_gate_full_suppression_c": 0.75,
     "max_step_per_write": 3.0,
     "prio_entity": "", "compressor_status_entity": "",
     "int_add_power_entity": "",
     "compressor_rated_kw": 1.7, "pump_overhead_kw": 0.12,
+    "compressor_hw_kw": 2.1, "brine_pump_kw": 0.06, "standby_kw": 0.02,
+    "hm_pump_speed_entity": "sensor.supply_pump_speed_ep14_43437",
     "price_rolling_window_days": 21.0,
     "log_level": "info",
 }
@@ -566,9 +569,10 @@ class NibeController:
             if (cfg.get("indoor_enabled") and indoor_temp is not None
                     and indoor_set is not None):
                 dead_band_plan = float(cfg.get("indoor_gate_dead_band", 0.5))
+                full_supp_plan = float(cfg.get("indoor_gate_full_suppression_c", 0.75))
                 overshoot = indoor_temp - indoor_set - dead_band_plan
                 if overshoot > 0:
-                    gf = max(0.0, 1.0 - overshoot / 2.0)
+                    gf = max(0.0, 1.0 - overshoot / max(0.1, full_supp_plan))
                     if w_slot > 0: w_slot = round(w_slot * gf, 2)
                     if p_slot > 0: p_slot = round(p_slot * gf, 2)
                     if solar_offset > 0: solar_offset = round(solar_offset * gf, 2)
@@ -647,13 +651,36 @@ class NibeController:
             self._live["actual_curve_offset"] = round(val, 1)
 
     async def _update_power_estimate(self):
-        """Estimate heat pump electrical power from compressor status +
-        immersion heater register. F1245-8 is fixed speed: compressor either
-        draws its rated input (~1.7 kW at 0/35) or nothing. Pump overhead
-        (brine GP2 + heating medium GP1) only applies while the compressor runs."""
+        """Estimate heat pump electrical power. F1245-8 is fixed speed: the
+        compressor either draws its rated input or nothing — but that input
+        is NOT the same for space heating vs hot water. Hot water targets a
+        much higher condensing temperature (~46-50°C) than underfloor space
+        heating (~35°C), and the manual's own EN14511 figures show COP
+        dropping substantially between the 0/35 and 0/45 conditions for this
+        unit — meaning materially higher electrical draw per hour of
+        compressor-on time during hot water production. A single flat
+        number for "compressor on" silently underestimates every HW cycle.
+        We already read `prio` (heat/hot water/off) for the curve-offset
+        write guard, so reusing it here to pick between two draw constants
+        is nearly free. The HW figure is a physically-reasoned estimate
+        (COP-derived), not a manual figure confirmed to two decimals —
+        refine it against a real CT clamp reading when installed.
+
+        Circulation pump power is also no longer a flat guess: the heating
+        medium pump (GP1) reports live speed (%) which we scale across the
+        manual's documented 7-67W range, and this now applies regardless of
+        compressor state, since "auto" pump mode can circulate independently
+        of active compression. Brine pump (GP2) stays a flat compressor-
+        gated estimate (30-87W range, no live speed entity available) since
+        it only runs during active refrigeration cycles. A small standby
+        draw is added always-on, since the control board/display never
+        fully power down even when everything else is idle.
+        """
         cfg = self.cfg
         cpr_ent = cfg.get("compressor_status_entity", "")
         add_ent = cfg.get("int_add_power_entity", "")
+        prio_ent = cfg.get("prio_entity", "")
+        hm_speed_ent = cfg.get("hm_pump_speed_entity", "")
         if not cpr_ent and not add_ent:
             self._live.pop("est_power_kw", None)
             self._live.pop("compressor_on", None)
@@ -664,15 +691,36 @@ class NibeController:
             if raw is not None:
                 comp_on = raw.lower() in ("on", "true", "1", "running")
         add_kw = await self.ha.get_float(add_ent) if add_ent else None
-        rated = float(cfg.get("compressor_rated_kw", 1.7))
-        pumps = float(cfg.get("pump_overhead_kw", 0.12))
-        total = 0.0
+        prio = await self.ha.get_state_raw(prio_ent) if prio_ent else None
+        is_hw = bool(prio) and "hot water" in prio.lower()
+
+        comp_kw = 0.0
         if comp_on:
-            total += rated + pumps
+            comp_kw = float(cfg.get("compressor_hw_kw", 2.1)) if is_hw \
+                      else float(cfg.get("compressor_rated_kw", 1.7))
+
+        # Brine pump: flat, compressor-gated (no live speed entity).
+        brine_kw = float(cfg.get("brine_pump_kw", 0.06)) if comp_on else 0.0
+
+        # Heating medium pump: scale real speed% across the manual's 7-67W
+        # range; independent of compressor state. Falls back to the old
+        # flat compressor-gated overhead if no speed entity is configured.
+        hm_speed = await self.ha.get_float(hm_speed_ent) if hm_speed_ent else None
+        if hm_speed is not None:
+            hm_w = 7.0 + (67.0 - 7.0) * max(0.0, min(100.0, hm_speed)) / 100.0
+            hm_kw = hm_w / 1000.0
+        else:
+            hm_kw = float(cfg.get("pump_overhead_kw", 0.12)) if comp_on else 0.0
+
+        standby_kw = float(cfg.get("standby_kw", 0.02))
+
+        total = comp_kw + brine_kw + hm_kw + standby_kw
         if add_kw:
             total += add_kw
         if comp_on is not None:
             self._live["compressor_on"] = comp_on
+        if prio:
+            self._live["prio"] = prio
         if comp_on is not None or add_kw is not None:
             self._live["est_power_kw"] = round(total, 2)
             # ── Lifetime energy counter (monotonic, never resets). This is
@@ -691,6 +739,7 @@ class NibeController:
                 "ts": now_ts, "kw": round(total, 3),
                 "comp": bool(comp_on) if comp_on is not None else None,
                 "add": round(add_kw, 2) if add_kw is not None else None,
+                "hw": is_hw,
             })
             if len(self.power_history) > MAX_POWER_SAMPLES:
                 self.power_history = self.power_history[-MAX_POWER_SAMPLES:]
@@ -708,10 +757,6 @@ class NibeController:
                 save_json(STATE_FILE, self.state)
         if add_kw is not None:
             self._live["int_add_kw"] = round(add_kw, 2)
-        prio_ent = cfg.get("prio_entity", "")
-        if prio_ent:
-            prio = await self.ha.get_state_raw(prio_ent)
-            if prio: self._live["prio"] = prio
 
     async def _run_weather(self):
         cfg = self.cfg
@@ -875,13 +920,25 @@ class NibeController:
         indoor_temp    = s.get("last_indoor_temp")
         indoor_set     = s.get("last_indoor_setpoint")
         dead_band      = float(cfg.get("indoor_gate_dead_band", 0.5))
+        full_supp_c    = float(cfg.get("indoor_gate_full_suppression_c", 0.75))
         gate_factor    = 1.0  # 1.0 = no suppression
         if (cfg.get("indoor_enabled") and indoor_temp is not None
                 and indoor_set is not None and indoor_temp > indoor_set + dead_band):
             # How far above setpoint+dead_band (in °C)
             overshoot = indoor_temp - indoor_set - dead_band
-            # Linearly suppress positive contributions: 0 at dead_band, full at dead_band+2°C
-            gate_factor = max(0.0, 1.0 - overshoot / 2.0)
+            # Linearly suppress positive contributions: 0 at dead_band,
+            # full suppression at dead_band + full_supp_c. Was hardcoded to
+            # a 2°C span, which let a flat VERY_CHEAP price incentive
+            # (e.g. +2°C) come through almost untouched (90%+) at a modest
+            # 0.2–0.7°C overshoot — exactly the "why is it still heating
+            # when the house is already warm" case. Default tightened to
+            # 0.75°C (from real-trace analysis: this roughly halves the
+            # rate of "still positive despite overshoot" cases vs the old
+            # 2.0 span); still tunable in Settings for anyone running
+            # slow-thermal-mass UFH who wants to keep more pre-heat
+            # opportunism at small overshoots (raise the value) or wants a
+            # near-binary cutoff instead (lower it, e.g. 0.3).
+            gate_factor = max(0.0, 1.0 - overshoot / max(0.1, full_supp_c))
             # Apply gate to weather and price (only suppress positive parts)
             w_gated = min(w, w * gate_factor) if w > 0 else w
             p_gated = min(p, p * gate_factor) if p > 0 else p
@@ -1075,9 +1132,10 @@ class WebApp:
                       "price_very_expensive_threshold","min_write_interval_min",
                       "planning_lookahead_hours","price_preheat_hours",
                       "solar_peak_kwh","solar_weight","battery_weight","battery_useful_soc_min",
-                      "indoor_gate_dead_band","max_step_per_write",
+                      "indoor_gate_dead_band","max_step_per_write","indoor_gate_full_suppression_c",
                       "compressor_rated_kw","pump_overhead_kw","price_rolling_window_days",
-                      "solar_window_start_hour","solar_window_end_hour"]:
+                      "solar_window_start_hour","solar_window_end_hour",
+                      "compressor_hw_kw","brine_pump_kw","standby_kw"]:
                 if k in body: body[k] = float(body[k])
             for k in ["weather_enabled","weather_enable_up","weather_enable_down",
                       "indoor_enabled","price_enabled","dry_run","planning_enabled","solar_enabled",
@@ -1660,10 +1718,22 @@ function SettingsTab() {
         h('div', {style:{width:14}}),
         h(EntityInput, {label:'Immersion heater power (e.g. sensor.int_el_add_power_43084)', name:'int_add_power_entity', value:cfg.int_add_power_entity, onChange:v=>set('int_add_power_entity',v), domains:['sensor']}),
       ),
+      h('div', {style:{fontSize:12,color:'#7b87a8',margin:'10px 0'}},
+        'Hot water production runs the compressor at a higher lift than space heating, drawing more power for the same "on" time — the manual\u2019s own COP figures drop noticeably between the two conditions. The estimate below distinguishes them using the Priority sensor above, rather than one flat number for all compressor-on time.'),
       h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:0}},
-        h(NumField, {label:'Compressor rated draw (kW)', value:cfg.compressor_rated_kw, min:0.5, max:5, step:0.05, hint:'F1245-8: ~1.70 kW at 0/35', onChange:v=>set('compressor_rated_kw',v)}),
+        h(NumField, {label:'Compressor draw — space heating (kW)', value:cfg.compressor_rated_kw, min:0.5, max:5, step:0.05, hint:'F1245-8: ~1.70 kW at 0/35', onChange:v=>set('compressor_rated_kw',v)}),
         h('div', {style:{width:14}}),
-        h(NumField, {label:'Pump overhead (kW)', value:cfg.pump_overhead_kw, min:0, max:0.5, step:0.01, hint:'Brine + heating medium pumps while compressor runs', onChange:v=>set('pump_overhead_kw',v)}),
+        h(NumField, {label:'Compressor draw — hot water (kW)', value:cfg.compressor_hw_kw, min:0.5, max:6, step:0.05, hint:'Estimate — higher lift, lower COP than space heating. Refine against a CT clamp once installed.', onChange:v=>set('compressor_hw_kw',v)}),
+      ),
+      h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:0,marginTop:10}},
+        h(EntityInput, {label:'Heating medium pump speed % (e.g. sensor.supply_pump_speed_ep14_43437)', name:'hm_pump_speed_entity', value:cfg.hm_pump_speed_entity, onChange:v=>set('hm_pump_speed_entity',v), domains:['sensor'], hint:'Scaled across the manual\u2019s 7\u201367W range; applies whether or not the compressor is running'}),
+        h('div', {style:{width:14}}),
+        h(NumField, {label:'Brine pump (kW)', value:cfg.brine_pump_kw, min:0, max:0.2, step:0.01, hint:'Flat, compressor-gated — no live speed entity available (30\u201387W range, manual)', onChange:v=>set('brine_pump_kw',v)}),
+      ),
+      h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:0,marginTop:10}},
+        h(NumField, {label:'Standby draw (kW)', value:cfg.standby_kw, min:0, max:0.1, step:0.005, hint:'Control board/display — always on, even fully idle', onChange:v=>set('standby_kw',v)}),
+        h('div', {style:{width:14}}),
+        h(NumField, {label:'Pump overhead fallback (kW)', value:cfg.pump_overhead_kw, min:0, max:0.5, step:0.01, hint:'Used only if the HM pump speed entity above is not set', onChange:v=>set('pump_overhead_kw',v)}),
       ),
 
       h(SectionHead, {title:'Weather forecast'}),
@@ -1691,10 +1761,13 @@ function SettingsTab() {
         h(NumField, {label:'Min. minutes between indoor reactions', value:cfg.indoor_min_reaction_interval_min, min:5, max:180, step:5, hint:'Underfloor slabs take hours to respond — reacting every cycle before that shows up causes hunting. 45–90 for UFH, 15–30 for radiators.', onChange:v=>set('indoor_min_reaction_interval_min',v)}),
       ),
       h(Toggle, {label:'Enable indoor temperature control', checked:!!cfg.indoor_enabled, onChange:v=>set('indoor_enabled',v)}),
-      cfg.indoor_enabled && h('div', {style:{maxWidth:300,marginTop:10}},
+      cfg.indoor_enabled && h('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,maxWidth:640,marginTop:10}},
         h(NumField, {label:'Gate dead band (°C)', value:cfg.indoor_gate_dead_band!=null?cfg.indoor_gate_dead_band:0.5, min:0, max:3, step:0.25,
-          hint:'If indoor exceeds setpoint by this much, heating offsets are suppressed. 0 = strict, 0.5 = recommended.',
-          onChange:v=>set('indoor_gate_dead_band',v)})
+          hint:'If indoor exceeds setpoint by this much, heating offsets start being suppressed. 0 = strict, 0.5 = recommended.',
+          onChange:v=>set('indoor_gate_dead_band',v)}),
+        h(NumField, {label:'Full suppression at +°C past dead band', value:cfg.indoor_gate_full_suppression_c!=null?cfg.indoor_gate_full_suppression_c:0.75, min:0.25, max:4, step:0.25,
+          hint:'Lower = a small overshoot fully blocks positive weather/price offsets sooner. 1.0 recommended; raise it if you deliberately want price-driven pre-heat even while slightly over setpoint.',
+          onChange:v=>set('indoor_gate_full_suppression_c',v)})
       ),
 
       h(SectionHead, {title:'Electricity price'}),
