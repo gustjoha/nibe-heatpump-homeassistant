@@ -44,6 +44,8 @@ All three offsets are summed and written to the NibeGW curve offset entity, with
 | `number.nibe_heat_curve_s1` | 47007 | Heat curve steepness (read) |
 | `number.nibe_heat_offset_s1` | 47011 | **Curve offset (addon writes here)** |
 
+Entity names from the `nibe_heatpump` integration vary by installation and can shift after an integration update or reinstall (e.g. `number.nibe_heat_offset_s1` vs `number.heat_offset_s1_47011`) — always confirm the actual entity ID in **Settings → Devices & services → NIBE → Entities** rather than assuming the example above matches your install.
+
 ### Recommended NIBE settings when using this addon
 
 The F1245 has its own internal room-compensation loop (**menu 1.9.4, "Room sensor settings"**), which nudges the calculated supply temperature based on the difference between a target room temperature and its own room sensor (BT50), scaled by a "factor system" gain. The installer manual itself warns that too high a factor system value can produce an unstable room temperature — which is exactly the risk of running that internal loop *and* this addon's indoor P-controller at the same time, especially if they're reading different physical sensors. **Set the room sensor factor system to 0 (or disable room sensor influence on the curve) so this addon is the sole source of indoor-driven correction.**

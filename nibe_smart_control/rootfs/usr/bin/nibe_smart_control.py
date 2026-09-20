@@ -567,10 +567,23 @@ class NibeController:
                     cfg.get("weather_enable_down", True))
 
             # Combine: weather + price + solar + battery + preheat
-            # Gate positive contributions if indoor is currently above setpoint
+            # Gate positive contributions if indoor is currently above
+            # setpoint — but only for h==0 (right now). indoor_temp/
+            # indoor_set are a single snapshot taken once at the top of this
+            # function, not a per-hour projection — we have no thermal model
+            # of the house to say what indoor temp will be 6 or 20 hours
+            # from now. Applying that one reading to every hour in the plan
+            # made the whole 24h preview collapse to near-zero whenever the
+            # house happened to be warm at the moment planning ran (the same
+            # "flat snapshot applied to every hour" mistake solar used to
+            # make before it got a real per-hour shape). The reactive 5-min
+            # loop already re-reads indoor temp fresh every cycle and is the
+            # one actually protecting against overheating in real time —
+            # this gate here is purely about making the *preview* honest for
+            # hours we can't forecast indoor temp for.
             w_slot = weather_offset
             p_slot = price_offset + preheat_offset
-            if (cfg.get("indoor_enabled") and indoor_temp is not None
+            if (h == 0 and cfg.get("indoor_enabled") and indoor_temp is not None
                     and indoor_set is not None):
                 dead_band_plan = float(cfg.get("indoor_gate_dead_band", 0.5))
                 full_supp_plan = float(cfg.get("indoor_gate_full_suppression_c", 0.75))
