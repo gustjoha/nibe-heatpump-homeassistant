@@ -32,7 +32,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import API_PATH, DOMAIN, SERVICE_BACKFILL, UPDATE_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.CLIMATE]
 
 BACKFILL_SCHEMA = vol.Schema(
     {

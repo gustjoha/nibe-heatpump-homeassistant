@@ -21,17 +21,44 @@
   },
   "entity": {
     "sensor": {
-      "combined_offset": { "name": "Curve offset (combined)" },
-      "weather_offset": { "name": "Weather offset" },
-      "indoor_offset": { "name": "Indoor offset" },
-      "price_offset": { "name": "Price offset" },
-      "indoor_temp": { "name": "Indoor temperature" },
-      "outdoor_temp": { "name": "Outdoor temperature" },
-      "electricity_price": { "name": "Electricity price" },
-      "price_level": { "name": "Price level" },
-      "estimated_power": { "name": "Estimated power" },
-      "lifetime_energy": { "name": "Estimated lifetime energy" },
-      "compressor_runtime_24h": { "name": "Compressor runtime (24h)" }
+      "combined_offset": {
+        "name": "Curve offset (combined)"
+      },
+      "weather_offset": {
+        "name": "Weather offset"
+      },
+      "indoor_offset": {
+        "name": "Indoor offset"
+      },
+      "price_offset": {
+        "name": "Price offset"
+      },
+      "indoor_temp": {
+        "name": "Indoor temperature"
+      },
+      "outdoor_temp": {
+        "name": "Outdoor temperature"
+      },
+      "electricity_price": {
+        "name": "Electricity price"
+      },
+      "price_level": {
+        "name": "Price level"
+      },
+      "estimated_power": {
+        "name": "Estimated power"
+      },
+      "lifetime_energy": {
+        "name": "Estimated lifetime energy"
+      },
+      "compressor_runtime_24h": {
+        "name": "Compressor runtime (24h)"
+      }
+    },
+    "climate": {
+      "indoor_climate": {
+        "name": "Indoor climate"
+      }
     }
   },
   "services": {
@@ -39,8 +66,14 @@
       "name": "Backfill history",
       "description": "One-time import of the addon's already-accumulated history into Home Assistant's long-term statistics.",
       "fields": {
-        "entry_id": { "name": "Config entry", "description": "The Nibe Smart Control Statistics config entry to backfill." },
-        "days": { "name": "Days", "description": "How many days of history to import." }
+        "entry_id": {
+          "name": "Config entry",
+          "description": "The Nibe Smart Control Statistics config entry to backfill."
+        },
+        "days": {
+          "name": "Days",
+          "description": "How many days of history to import."
+        }
       }
     }
   }

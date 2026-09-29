@@ -16,6 +16,7 @@ UPDATE_INTERVAL = timedelta(seconds=60)
 API_PATH = "/api/hastats"
 HISTORY_PATH = "/api/history"
 POWER_PATH = "/api/power"
+SETPOINT_PATH = "/api/setpoint"
 
 # statistic_id namespace used for backfilled EXTERNAL statistics
 # (recorder requires the "domain:name" form for external, i.e. non-entity,

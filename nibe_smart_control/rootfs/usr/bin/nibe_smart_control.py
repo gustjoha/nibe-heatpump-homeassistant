@@ -21,6 +21,7 @@ HISTORY_FILE = DATA_DIR / "history.json"
 POWER_FILE   = DATA_DIR / "power_history.json"
 PRICE_ROLLING_FILE = DATA_DIR / "price_rolling.json"
 MAX_HISTORY  = 500
+SETPOINT_MIN, SETPOINT_MAX = 15.0, 25.0  # climate entity / /api/setpoint bounds
 MAX_POWER_SAMPLES = 2880  # 48h of 1-minute samples
 MIN_ROLLING_SAMPLES_FOR_DYNAMIC = 48  # ~half a day of 15-min entries before trusting percentiles
 MIN_WRITE_INTERVAL = 10
@@ -132,6 +133,15 @@ class HAClient:
                 if raw in (None, "unavailable", "unknown", ""): return None
                 return str(raw)
         except Exception: return None
+
+    async def call_service(self, domain: str, service: str, data: dict) -> bool:
+        url = f"{self.base}/services/{domain}/{service}"
+        try:
+            async with self.session.post(url, headers=self.headers, json=data,
+                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return r.status in (200, 201)
+        except Exception as e:
+            self.logger.error(f"call_service({domain}.{service}): {e}"); return False
 
     async def set_number(self, entity_id: str, value) -> bool:
         url = f"{self.base}/services/number/set_value"
@@ -1103,6 +1113,7 @@ class WebApp:
         app.router.add_get("/api/history",  self._history)
         app.router.add_get("/api/config",   self._config_get)
         app.router.add_post("/api/config",  self._config_post)
+        app.router.add_post("/api/setpoint", self._setpoint_post)
         app.router.add_get("/api/entities", self._entities)
         app.router.add_get("/api/plan",     self._plan_api)
         app.router.add_get("/api/power",    self._power_api)
@@ -1138,7 +1149,7 @@ class WebApp:
         backward compatible so the integration doesn't break on addon updates."""
         s = self.ctrl.get_status()
         return web.json_response({
-            "schema": 1, "ts": int(time.time()),
+            "schema": 2, "ts": int(time.time()),
             "combined_offset_c":  s.get("combined_offset"),
             "weather_offset_c":   s.get("weather_offset"),
             "indoor_offset_c":    s.get("indoor_offset"),
@@ -1156,7 +1167,54 @@ class WebApp:
             "comp_runtime_24h_h": s.get("comp_runtime_24h_h"),
             "compressor_on":      s.get("compressor_on"),
             "dry_run":            s.get("dry_run"),
+            # schema 2 additions (additive — schema-1 consumers ignore them)
+            "prio":               s.get("prio"),
+            "indoor_control_enabled": bool(self.ctrl.cfg.get("indoor_enabled")),
+            "setpoint_min_c":     SETPOINT_MIN,
+            "setpoint_max_c":     SETPOINT_MAX,
+            "setpoint_source":    "entity" if self.ctrl.cfg.get("indoor_setpoint_entity") else "config",
         })
+
+    async def _setpoint_post(self, req):
+        """Set the indoor target temperature (used by the HA climate entity).
+
+        Writes to wherever the setpoint actually lives: the configured
+        indoor_setpoint_entity if one is set (input_number / number only —
+        a read-only sensor can't be written, so that returns 409), otherwise
+        the addon's own indoor_target_temp config value. Then clears the
+        thermal-lag hold and re-runs the indoor loop immediately: the hold
+        exists to stop the controller chasing its own slow slab response,
+        not to delay a deliberate user change by up to 45 minutes.
+        """
+        try:
+            body = await req.json()
+            target = round(float(body["temperature"]) * 2) / 2  # 0.5°C steps
+        except Exception:
+            return web.json_response({"ok": False, "error": "body must be {\"temperature\": <number>}"}, status=400)
+        if not (SETPOINT_MIN <= target <= SETPOINT_MAX):
+            return web.json_response({"ok": False, "error": f"temperature must be {SETPOINT_MIN}–{SETPOINT_MAX}°C"}, status=400)
+
+        ctrl = self.ctrl
+        sp_ent = ctrl.cfg.get("indoor_setpoint_entity", "")
+        if sp_ent:
+            domain = sp_ent.split(".", 1)[0]
+            if domain not in ("input_number", "number"):
+                return web.json_response({"ok": False, "error":
+                    f"setpoint comes from read-only {sp_ent}; change it at its source "
+                    "or clear 'Setpoint entity' in addon Settings to use the addon's own target"}, status=409)
+            if not await ctrl.ha.call_service(domain, "set_value", {"entity_id": sp_ent, "value": target}):
+                return web.json_response({"ok": False, "error": f"failed to write {sp_ent}"}, status=502)
+        else:
+            ctrl.cfg["indoor_target_temp"] = target
+            save_json(CONFIG_FILE, ctrl.cfg)
+
+        ctrl.state["last_indoor_offset_change_ts"] = 0  # bypass thermal-lag hold for a user change
+        ctrl.logger.info(f"Setpoint changed to {target:.1f}°C via API ({'entity '+sp_ent if sp_ent else 'addon config'})")
+        try:
+            await ctrl._run_indoor()
+        except Exception as e:
+            ctrl.logger.error(f"indoor re-run after setpoint change: {e}")
+        return web.json_response({"ok": True, "temperature": target})
 
     async def _config_get(self, req): return web.json_response(self.ctrl.cfg)
 

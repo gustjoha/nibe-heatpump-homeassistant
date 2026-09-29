@@ -123,6 +123,17 @@ A separate **custom component** (not an addon) lives in [`custom_components/nibe
 2. **Settings → Devices & services → Add integration → Nibe Smart Control Statistics**
 3. Enter the addon's host and port 8099. Find the hostname under **Settings → Add-ons → Nibe Smart Control → Info** (usually the slug with hyphens, e.g. `32c51978-nibe-smart-control`), or use the HA host's LAN IP.
 
+### Thermostat card (climate entity)
+
+The integration also creates `climate.nibe_smart_control_indoor_climate`, which shows indoor temperature and the controller's setpoint and lets you change the setpoint from a normal thermostat card:
+
+```yaml
+type: thermostat
+entity: climate.nibe_smart_control_indoor_climate
+```
+
+Setting a temperature calls the addon's `/api/setpoint` (0.5°C steps, 15–25°C). It does not write to the heat pump directly — the addon's control loop still decides the curve offset, with every safety gate and dry run in force. If a "Setpoint entity" is configured in the addon, the new value is written to that entity (it must be an `input_number` or `number`); otherwise it's stored as the addon's own target temperature. A deliberate setpoint change bypasses the indoor thermal-lag hold so it takes effect straight away. There is intentionally no OFF mode on the card — disabling control stays in the addon's Settings. Indoor temperature control must be enabled in the addon for the setpoint to have any effect.
+
 ### Backfilling pre-existing history
 
 If the addon already has history from before you installed the integration, run the one-shot service once: **Developer tools → Actions → `Nibe Smart Control Statistics: Backfill history`**. This imports past data via HA's external-statistics API into its own named series (visible in the Statistics UI, separate from the live entities). Don't run it a second time over an overlapping window — the energy total will double-count.
